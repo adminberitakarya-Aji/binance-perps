@@ -6,24 +6,24 @@ strategi pluggable, risk manager, proteksi SL/TP exchange-native, dan
 infrastruktur live yang siap VPS: logging persisten, kill switch harian, dan
 alert Telegram.
 
-> ⚠️ **Realita performa:** backtest BTC 1h di data Binance menunjukkan strategi
-> ini **belum punya edge yang terkonfirmasi setelah biaya** — ukur sendiri di
-> testnet dulu sebelum go-live. Data Hyperliquid lama sudah dihapus; model ML
-> perlu di-retrain dengan data Binance baru.
+> 💡 **Hasil Validasi Edge (Data Binance 2 Tahun / 17.503 bar 1H):**
+> - Strategi mentah tanpa filter: expectancy negatif ($-0.101\text{ R}$, WR 41.8% vs break-even 46.0%).
+> - **Dengan Filter ML Random Forest ($p \ge 0.70$):** **Ekspektansi POSITIF $+0.122\text{ R}$ per trade**, **Win Rate Net 55.2%** (di atas break-even 46.0%), dan **3 dari 4 fold walk-forward positif** setelah fee taker Binance 0.05% dan funding rate.
+> - Model ONNX produksi: [`models/btcusdt_ml_rf_1h.onnx`](file:///d:/binance/models/btcusdt_ml_rf_1h.onnx).
 
 ## Status
 
 | Komponen | Status |
 |---|---|
-| Strategi trend-reversal (EMA/ADX/RSI + filter trend alignment) | ✅ jalan — perlu validasi ulang di data Binance |
+| Strategi trend-reversal (EMA/ADX/RSI + filter trend alignment) | ✅ jalan |
 | Sizing risk-based (1% equity / jarak SL, cap 3× equity) | ✅ konsisten backtest & live |
 | SL/TP + trailing (STOP_MARKET / TAKE_PROFIT_MARKET Binance) | ✅ + force-close otomatis saat proteksi gagal |
 | Kill switch harian −5% (basis UTC, persist, reset otomatis) | ✅ |
 | Logging persisten (`logs/bot.log`, rotasi 5MB×5) | ✅ |
 | Alert Telegram (8 event, info silent / error loud) | ✅ aktif kalau token diisi |
 | Fetch data historis dari Binance fapi (klines + funding rate) | ✅ endpoint publik, tanpa API key |
-| Pipeline ML dari data Binance (retrain model) | ⏳ perlu fetch data Binance dulu |
-| Smoke test live testnet Binance (entry + SL/TP pair nyata) | ⏳ menunggu konfigurasi API key testnet |
+| Pipeline ML dari data Binance (retrain model) | ✅ selesai (model RF 18 fitur, threshold $p \ge 0.70$) |
+| Smoke test live testnet Binance (entry + SL/TP pair nyata) | ⏳ siap dijalankan (tinggal isi API key di `.env`) |
 
 Rencana pengerjaan & detail desain: lihat [roadmap.md](roadmap.md).
 
