@@ -85,21 +85,30 @@ class RiskManager:
         return position_size
 
     def compute_sl_tp(self, signal: Signal, entry_price: float, atr: float) -> tuple[float, float]:
-        """SL/TP awal: gunakan mode 'atr' (adaptif) atau 'pct' (% harga tetap)."""
+        """SL/TP awal: gunakan mode 'atr' (adaptif) atau 'pct' (% harga tetap).
+
+        Jika DCA aktif (dca_enabled=True), jarak SL diletakkan di bawah seluruh lapis DCA
+        agar Lapis 2 dan Lapis 3 memiliki ruang untuk averaging down tanpa tertabrak SL Lapis 1.
+        """
         if self.limits.tpsl_mode == "pct":
-            sl_distance = entry_price * (self.limits.sl_pct / 100.0)
             tp_distance = entry_price * (self.limits.tp_pct / 100.0)
-            log.debug(
-                "TPSL mode=pct: SL=%.2f%% ($%.2f) TP=%.2f%% ($%.2f)",
-                self.limits.sl_pct, sl_distance, self.limits.tp_pct, tp_distance,
-            )
+            if self.limits.dca_enabled and self.limits.dca_max_orders > 1:
+                # Total jarak SL = seluruh lapis DCA + buffer SL
+                total_drop_pct = (self.limits.dca_max_orders * self.limits.dca_step_pct) + self.limits.sl_pct
+                sl_distance = entry_price * (total_drop_pct / 100.0)
+                log.debug("DCA aktif (mode pct): SL diletakkan %.2f%% di bawah entry ($%.2f)", total_drop_pct, sl_distance)
+            else:
+                sl_distance = entry_price * (self.limits.sl_pct / 100.0)
+                log.debug("Single entry (mode pct): SL=%.2f%% ($%.2f) TP=%.2f%% ($%.2f)", self.limits.sl_pct, sl_distance, self.limits.tp_pct, tp_distance)
         else:  # mode atr (default)
-            sl_distance = atr * self.limits.atr_sl_mult
-            tp_distance = sl_distance * self.limits.tp_rr_ratio
-            log.debug(
-                "TPSL mode=atr: SL=%.2fx ATR ($%.2f) TP=%.2fx SL ($%.2f)",
-                self.limits.atr_sl_mult, sl_distance, self.limits.tp_rr_ratio, tp_distance,
-            )
+            tp_distance = (atr * self.limits.atr_sl_mult) * self.limits.tp_rr_ratio
+            if self.limits.dca_enabled and self.limits.dca_max_orders > 1:
+                total_drop_atr = (self.limits.dca_max_orders * self.limits.dca_step_atr_mult) + self.limits.atr_sl_mult
+                sl_distance = atr * total_drop_atr
+                log.debug("DCA aktif (mode atr): SL diletakkan %.2fx ATR di bawah entry ($%.2f)", total_drop_atr, sl_distance)
+            else:
+                sl_distance = atr * self.limits.atr_sl_mult
+                log.debug("Single entry (mode atr): SL=%.2fx ATR ($%.2f) TP=%.2fx SL ($%.2f)", self.limits.atr_sl_mult, sl_distance, self.limits.tp_rr_ratio, tp_distance)
 
         if signal == Signal.BUY:
             sl = entry_price - sl_distance
