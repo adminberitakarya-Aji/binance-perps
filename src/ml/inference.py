@@ -27,6 +27,15 @@ log = get_logger("ml_inference")
 DEFAULT_MODEL_PATH = os.path.join("models", "btcusdt_ml_rf_1h.onnx")
 
 
+def get_default_model_path_for_interval(interval: str = "1h") -> str:
+    """Otomatis pilih model ONNX yang sesuai dengan timeframe trading."""
+    interval_clean = interval.strip().lower()
+    candidate = os.path.join("models", f"btcusdt_ml_rf_{interval_clean}.onnx")
+    if os.path.exists(candidate):
+        return candidate
+    return DEFAULT_MODEL_PATH
+
+
 class MLSignalFilter:
     def __init__(self, model_path: str = DEFAULT_MODEL_PATH,
                  threshold: float | None = None):

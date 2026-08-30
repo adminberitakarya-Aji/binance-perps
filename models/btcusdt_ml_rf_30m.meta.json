@@ -1,0 +1,44 @@
+{
+  "model": "RandomForestClassifier",
+  "interval": "30m",
+  "input": {
+    "name": "float_input",
+    "shape": [
+      null,
+      19
+    ],
+    "dtype": "float32"
+  },
+  "output_probabilities_index": 1,
+  "class_order": [
+    0,
+    1
+  ],
+  "feature_order": [
+    "dist_to_ema_atr",
+    "adx_main",
+    "adx_pdi",
+    "adx_mdi",
+    "adx_di_diff",
+    "rsi",
+    "atr_normalized",
+    "body_atr",
+    "upper_shadow_atr",
+    "lower_shadow_atr",
+    "hour",
+    "day_of_week",
+    "signal_type",
+    "vol_ratio_20",
+    "vol_ratio_100",
+    "funding_rate",
+    "rv_50",
+    "dist_hi_500_atr",
+    "dist_lo_500_atr"
+  ],
+  "decision_rule": {
+    "signal": "proba[:,1] >= threshold",
+    "threshold": 0.5,
+    "fail_closed": true
+  },
+  "samples": 14981
+}

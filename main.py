@@ -76,13 +76,10 @@ def build_engine(config: Config) -> tuple[TradingEngine, TelegramNotifier, objec
     ml_filter = None
     if config.ml_filter_enabled:
         try:
-            from src.ml.inference import MLSignalFilter
-            model_path = config.ml_model_path or None
-            if model_path:
-                ml_filter = MLSignalFilter(model_path, threshold=config.ml_threshold)
-            else:
-                ml_filter = MLSignalFilter(threshold=config.ml_threshold)
-            log.info("Filter ML aktif (threshold %.2f)", config.ml_threshold)
+            from src.ml.inference import MLSignalFilter, get_default_model_path_for_interval
+            model_path = config.ml_model_path or get_default_model_path_for_interval(config.trading_interval)
+            ml_filter = MLSignalFilter(model_path=model_path, threshold=config.ml_threshold)
+            log.info("Filter ML aktif [%s] (threshold %.2f)", model_path, config.ml_threshold)
         except Exception as e:
             log.error("Gagal muat filter ML: %s -- bot TIDAK dijalankan (fail-closed)", e)
             raise SystemExit(1)
