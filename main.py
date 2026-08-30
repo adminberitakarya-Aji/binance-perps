@@ -160,7 +160,18 @@ def main():
         default=False,
         help="Tampilkan dashboard terminal visual real-time (default: mode log biasa)",
     )
+    parser.add_argument(
+        "--settings", "--gui",
+        action="store_true",
+        default=False,
+        help="Buka jendela Desktop GUI Settings (MT5 Style Inputs Parameters)",
+    )
     args = parser.parse_args()
+
+    if args.settings:
+        from src.ui.settings_gui import launch_settings_gui
+        launch_settings_gui()
+        return
 
     config = Config.from_env()
     engine, notifier, ml_filter = build_engine(config)
