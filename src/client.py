@@ -324,81 +324,123 @@ class BinanceFuturesClient:
         sl: float,
         tp: float | None = None,
     ) -> list:
-        """Pasang STOP_MARKET (SL) dan opsional TAKE_PROFIT_MARKET (TP).
+        """Pasang STOP_MARKET (SL) dan opsional TAKE_PROFIT_MARKET (TP) reduce-only.
 
-        Menggunakan closePosition=true (tanpa quantity) agar kompatibel dengan
-        Binance Futures API terbaru yang menolak quantity+reduceOnly di endpoint
-        /fapi/v1/order untuk tipe STOP_MARKET/TAKE_PROFIT_MARKET (error -4120).
+        Menggunakan endpoint resmi Binance Futures Algo Order (/fapi/v1/algoOrder)
+        karena order tipe conditional (STOP_MARKET / TAKE_PROFIT_MARKET) telah
+        dimigrasikan sepenuhnya ke Algo Service Binance.
         """
         close_side = "BUY" if close_is_buy else "SELL"
+        qty = self.round_size(symbol, size)
         results = []
 
-        # 1. Stop Loss (STOP_MARKET) — pakai closePosition=true
+        # 1. Stop Loss (STOP_MARKET) via Algo Order API
         sl_px = self.round_price(symbol, sl)
         sl_params = {
             "symbol": symbol,
             "side": close_side,
             "type": "STOP_MARKET",
-            "stopPrice": sl_px,
-            "closePosition": "true",       # tutup seluruh posisi, tidak perlu quantity
+            "algoType": "CONDITIONAL",
+            "triggerPrice": sl_px,
+            "quantity": qty,
+            "reduceOnly": "true",
             "workingType": "MARK_PRICE",
-            "priceProtect": "true",        # tolak jika harga terlalu jauh dari mark price
         }
         sl_res = validate_order_result(
-            self._request("POST", "/fapi/v1/order", sl_params, signed=True),
+            self._request("POST", "/fapi/v1/algoOrder", sl_params, signed=True),
             f"SL {symbol}",
         )
         results.append(sl_res)
-        log.info("SL dipasang %s @ %.2f (closePosition=true)", symbol, sl_px)
+        log.info("SL dipasang %s @ %.2f (algoId=%s)", symbol, sl_px, sl_res.get("algoId"))
 
-        # 2. Take Profit (TAKE_PROFIT_MARKET) — pakai closePosition=true
+        # 2. Take Profit (TAKE_PROFIT_MARKET) via Algo Order API
         if tp is not None and tp > 0:
             tp_px = self.round_price(symbol, tp)
             tp_params = {
                 "symbol": symbol,
                 "side": close_side,
                 "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": tp_px,
-                "closePosition": "true",   # tutup seluruh posisi
+                "algoType": "CONDITIONAL",
+                "triggerPrice": tp_px,
+                "quantity": qty,
+                "reduceOnly": "true",
                 "workingType": "MARK_PRICE",
-                "priceProtect": "true",
             }
             tp_res = validate_order_result(
-                self._request("POST", "/fapi/v1/order", tp_params, signed=True),
+                self._request("POST", "/fapi/v1/algoOrder", tp_params, signed=True),
                 f"TP {symbol}",
             )
             results.append(tp_res)
-            log.info("TP dipasang %s @ %.2f (closePosition=true)", symbol, tp_px)
+            log.info("TP dipasang %s @ %.2f (algoId=%s)", symbol, tp_px, tp_res.get("algoId"))
 
         return results
 
     def get_trigger_orders(self, symbol: str) -> list:
         """Conditional open orders (STOP_MARKET, TAKE_PROFIT_MARKET) satu simbol.
-        Menghasilkan list dict dengan key oid, triggerCondition, stopPrice agar kompatibel.
+        Mendukung endpoint /fapi/v1/openAlgoOrders (Algo API baru) dan fallback /fapi/v1/openOrders.
+        Menghasilkan list dict dengan key oid, triggerCondition, stopPrice, is_algo agar kompatibel.
         """
-        orders = self._request("GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
-        if not isinstance(orders, list):
-            return []
-
         triggers = []
-        for o in orders:
-            o_type = o.get("type", "")
-            if o_type in ("STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
-                is_sl = "STOP" in o_type
-                triggers.append({
-                    "oid": o.get("orderId"),
-                    "orderId": o.get("orderId"),
-                    "coin": symbol,
-                    "symbol": symbol,
-                    "type": o_type,
-                    "side": o.get("side"),
-                    "stopPrice": float(o.get("stopPrice") or 0),
-                    "triggerCondition": "sl" if is_sl else "tp",
-                    "origQty": float(o.get("origQty") or 0),
-                })
+
+        # 1. Query dari Algo Orders API (utama)
+        try:
+            algo_orders = self._request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol}, signed=True)
+            if isinstance(algo_orders, list):
+                for o in algo_orders:
+                    o_type = o.get("orderType", "") or o.get("type", "")
+                    is_sl = "STOP" in o_type
+                    triggers.append({
+                        "oid": o.get("algoId"),
+                        "orderId": o.get("algoId"),
+                        "algoId": o.get("algoId"),
+                        "coin": symbol,
+                        "symbol": symbol,
+                        "type": o_type,
+                        "side": o.get("side"),
+                        "stopPrice": float(o.get("triggerPrice") or o.get("stopPrice") or 0),
+                        "triggerCondition": "sl" if is_sl else "tp",
+                        "origQty": float(o.get("quantity") or o.get("origQty") or 0),
+                        "is_algo": True,
+                    })
+        except Exception as e:
+            log.debug("Gagal query openAlgoOrders %s: %s", symbol, e)
+
+        # 2. Fallback query dari openOrders biasa jika ada
+        try:
+            orders = self._request("GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
+            if isinstance(orders, list):
+                for o in orders:
+                    o_type = o.get("type", "")
+                    if o_type in ("STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
+                        is_sl = "STOP" in o_type
+                        triggers.append({
+                            "oid": o.get("orderId"),
+                            "orderId": o.get("orderId"),
+                            "coin": symbol,
+                            "symbol": symbol,
+                            "type": o_type,
+                            "side": o.get("side"),
+                            "stopPrice": float(o.get("stopPrice") or 0),
+                            "triggerCondition": "sl" if is_sl else "tp",
+                            "origQty": float(o.get("origQty") or 0),
+                            "is_algo": False,
+                        })
+        except Exception as e:
+            log.debug("Gagal query openOrders %s: %s", symbol, e)
+
         return triggers
 
     def cancel_order(self, symbol: str, order_id: int | str) -> dict:
+        """Cancel order biasa atau algo order."""
+        # Coba cancel via Algo API terlebih dahulu
+        try:
+            res = self._request("DELETE", "/fapi/v1/algoOrder", {"symbol": symbol, "algoId": order_id}, signed=True)
+            if isinstance(res, dict) and res.get("code") in (200, "200", None) and res.get("msg") != "Unknown error":
+                return res
+        except Exception:
+            pass
+
+        # Fallback cancel order biasa
         params = {"symbol": symbol, "orderId": order_id}
         return self._request("DELETE", "/fapi/v1/order", params, signed=True)
 
@@ -422,23 +464,24 @@ class BinanceFuturesClient:
         size: float,
         new_sl: float,
     ) -> dict:
-        """Geser trigger SL: pasang SL baru terlebih dahulu, lalu batalkan SL lama."""
+        """Geser trigger SL: pasang SL baru via Algo API, lalu batalkan SL lama."""
         new_sl_px = self.round_price(symbol, new_sl)
         close_side = "BUY" if close_is_buy else "SELL"
         qty = self.round_size(symbol, size)
 
-        # Pasang SL baru (pakai closePosition=true, tanpa quantity)
+        # Pasang SL baru via Algo Order API
         sl_params = {
             "symbol": symbol,
             "side": close_side,
             "type": "STOP_MARKET",
-            "stopPrice": new_sl_px,
-            "closePosition": "true",
+            "algoType": "CONDITIONAL",
+            "triggerPrice": new_sl_px,
+            "quantity": qty,
+            "reduceOnly": "true",
             "workingType": "MARK_PRICE",
-            "priceProtect": "true",
         }
         new_res = validate_order_result(
-            self._request("POST", "/fapi/v1/order", sl_params, signed=True),
+            self._request("POST", "/fapi/v1/algoOrder", sl_params, signed=True),
             f"new SL {symbol}",
         )
 
