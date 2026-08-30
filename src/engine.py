@@ -198,7 +198,9 @@ class TradingEngine:
 
             atr = self._get_last_atr(snapshot)
             sl_distance_pct = None
-            if atr is not None and atr > 0 and snapshot.mid_price > 0:
+            if self.risk_manager.limits.tpsl_mode == "pct":
+                sl_distance_pct = self.risk_manager.limits.sl_pct / 100.0
+            elif atr is not None and atr > 0 and snapshot.mid_price > 0:
                 sl_distance_pct = (atr * self.risk_manager.limits.atr_sl_mult) / snapshot.mid_price
 
             equity_usd = self._get_equity_or_none()

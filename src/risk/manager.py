@@ -176,7 +176,11 @@ class RiskManager:
         total_cost = sum(layer["price"] * layer["size"] for layer in layers)
         avg_price = total_cost / total_size
 
-        tp_distance = entry_atr * self.limits.dca_tp_rr_ratio
+        if self.limits.tpsl_mode == "pct":
+            tp_distance = avg_price * (self.limits.tp_pct / 100.0)
+        else:
+            tp_distance = entry_atr * self.limits.dca_tp_rr_ratio
+
         if signal == Signal.BUY:
             new_tp = avg_price + tp_distance
         else:
