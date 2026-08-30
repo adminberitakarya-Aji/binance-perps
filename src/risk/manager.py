@@ -17,8 +17,13 @@ class RiskLimits:
     max_leverage: float = 3.0          # batas maksimum notional cap (3x equity)
     max_daily_loss_pct: float = 0.05   # kill switch harian otomatis (-5%)
     min_confidence: float = 0.5        # abaikan sinyal di bawah ini
-    atr_sl_mult: float = 2.0           # SL = ATR * mult (adaptif volatilitas)
-    tp_rr_ratio: float = 1.5           # TP = jarak SL * rasio (RR fixed)
+
+    # --- Mode TP/SL: "atr" (adaptif volatilitas) atau "pct" (% harga tetap) ---
+    tpsl_mode: str = "atr"
+    atr_sl_mult: float = 2.0           # SL = ATR * mult          [mode: atr]
+    tp_rr_ratio: float = 1.5           # TP = jarak SL * rasio    [mode: atr]
+    sl_pct: float = 0.5                # SL = sl_pct% dari entry  [mode: pct]
+    tp_pct: float = 1.0                # TP = tp_pct% dari entry  [mode: pct]
 
     # --- Position sizing berbasis risiko (risk percent per trade) ---
     risk_per_trade_pct: float = 0.01   # 1% equity risiko per trade
@@ -32,9 +37,10 @@ class RiskLimits:
     # --- Smart DCA / Grid Settings ---
     dca_enabled: bool = False               # true = izinkan penambahan lapis saat floating minus
     dca_max_orders: int = 3                 # Maksimal jumlah lapis (termasuk entry awal)
-    dca_step_atr_mult: float = 1.5          # Jarak buka lapis berikutnya (tiap minus 1.5x ATR)
+    dca_step_atr_mult: float = 1.5          # Jarak buka lapis berikutnya (ATR mult)  [mode: atr]
+    dca_step_pct: float = 0.5              # Jarak buka lapis berikutnya (% harga)    [mode: pct]
     dca_lot_multiplier: float = 1.0         # Pengali lot lapis berikutnya (1.0 = equal sizing)
-    dca_tp_rr_ratio: float = 1.0            # TP gabungan = avg_price +/- (ATR * rasio)
+    dca_tp_rr_ratio: float = 1.0            # TP gabungan = avg_price +/- (ATR * rasio) [mode: atr]
     dca_hard_sl_equity_pct: float = 0.03    # Cut-loss total jika floating loss >= 3% modal akun
 
 
@@ -79,9 +85,21 @@ class RiskManager:
         return position_size
 
     def compute_sl_tp(self, signal: Signal, entry_price: float, atr: float) -> tuple[float, float]:
-        """SL/TP awal berbasis ATR & harga langsung."""
-        sl_distance = atr * self.limits.atr_sl_mult
-        tp_distance = sl_distance * self.limits.tp_rr_ratio
+        """SL/TP awal: gunakan mode 'atr' (adaptif) atau 'pct' (% harga tetap)."""
+        if self.limits.tpsl_mode == "pct":
+            sl_distance = entry_price * (self.limits.sl_pct / 100.0)
+            tp_distance = entry_price * (self.limits.tp_pct / 100.0)
+            log.debug(
+                "TPSL mode=pct: SL=%.2f%% ($%.2f) TP=%.2f%% ($%.2f)",
+                self.limits.sl_pct, sl_distance, self.limits.tp_pct, tp_distance,
+            )
+        else:  # mode atr (default)
+            sl_distance = atr * self.limits.atr_sl_mult
+            tp_distance = sl_distance * self.limits.tp_rr_ratio
+            log.debug(
+                "TPSL mode=atr: SL=%.2fx ATR ($%.2f) TP=%.2fx SL ($%.2f)",
+                self.limits.atr_sl_mult, sl_distance, self.limits.tp_rr_ratio, tp_distance,
+            )
 
         if signal == Signal.BUY:
             sl = entry_price - sl_distance
@@ -110,10 +128,17 @@ class RiskManager:
         if current_layer_count >= self.limits.dca_max_orders:
             return False
 
-        if entry_atr <= 0 or last_layer_price <= 0 or current_price <= 0:
+        if last_layer_price <= 0 or current_price <= 0:
             return False
 
-        required_drop = entry_atr * self.limits.dca_step_atr_mult
+        if self.limits.tpsl_mode == "pct":
+            # Mode pct: jarak lapis = % dari harga lapis terakhir
+            required_drop = last_layer_price * (self.limits.dca_step_pct / 100.0)
+        else:
+            # Mode atr: jarak lapis = ATR * multiplier
+            if entry_atr <= 0:
+                return False
+            required_drop = entry_atr * self.limits.dca_step_atr_mult
 
         if signal == Signal.BUY:
             # BUY: harga harus turun sebesar required_drop dari entry lapis terakhir

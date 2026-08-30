@@ -324,29 +324,34 @@ class BinanceFuturesClient:
         sl: float,
         tp: float | None = None,
     ) -> list:
-        """Pasang STOP_MARKET (SL) dan opsional TAKE_PROFIT_MARKET (TP) reduce-only."""
+        """Pasang STOP_MARKET (SL) dan opsional TAKE_PROFIT_MARKET (TP).
+
+        Menggunakan closePosition=true (tanpa quantity) agar kompatibel dengan
+        Binance Futures API terbaru yang menolak quantity+reduceOnly di endpoint
+        /fapi/v1/order untuk tipe STOP_MARKET/TAKE_PROFIT_MARKET (error -4120).
+        """
         close_side = "BUY" if close_is_buy else "SELL"
-        qty = self.round_size(symbol, size)
         results = []
 
-        # 1. Stop Loss (STOP_MARKET)
+        # 1. Stop Loss (STOP_MARKET) — pakai closePosition=true
         sl_px = self.round_price(symbol, sl)
         sl_params = {
             "symbol": symbol,
             "side": close_side,
             "type": "STOP_MARKET",
             "stopPrice": sl_px,
-            "quantity": qty,
-            "reduceOnly": "true",
+            "closePosition": "true",       # tutup seluruh posisi, tidak perlu quantity
             "workingType": "MARK_PRICE",
+            "priceProtect": "true",        # tolak jika harga terlalu jauh dari mark price
         }
         sl_res = validate_order_result(
             self._request("POST", "/fapi/v1/order", sl_params, signed=True),
             f"SL {symbol}",
         )
         results.append(sl_res)
+        log.info("SL dipasang %s @ %.2f (closePosition=true)", symbol, sl_px)
 
-        # 2. Take Profit (TAKE_PROFIT_MARKET)
+        # 2. Take Profit (TAKE_PROFIT_MARKET) — pakai closePosition=true
         if tp is not None and tp > 0:
             tp_px = self.round_price(symbol, tp)
             tp_params = {
@@ -354,15 +359,16 @@ class BinanceFuturesClient:
                 "side": close_side,
                 "type": "TAKE_PROFIT_MARKET",
                 "stopPrice": tp_px,
-                "quantity": qty,
-                "reduceOnly": "true",
+                "closePosition": "true",   # tutup seluruh posisi
                 "workingType": "MARK_PRICE",
+                "priceProtect": "true",
             }
             tp_res = validate_order_result(
                 self._request("POST", "/fapi/v1/order", tp_params, signed=True),
                 f"TP {symbol}",
             )
             results.append(tp_res)
+            log.info("TP dipasang %s @ %.2f (closePosition=true)", symbol, tp_px)
 
         return results
 
@@ -421,15 +427,15 @@ class BinanceFuturesClient:
         close_side = "BUY" if close_is_buy else "SELL"
         qty = self.round_size(symbol, size)
 
-        # Pasang SL baru
+        # Pasang SL baru (pakai closePosition=true, tanpa quantity)
         sl_params = {
             "symbol": symbol,
             "side": close_side,
             "type": "STOP_MARKET",
             "stopPrice": new_sl_px,
-            "quantity": qty,
-            "reduceOnly": "true",
+            "closePosition": "true",
             "workingType": "MARK_PRICE",
+            "priceProtect": "true",
         }
         new_res = validate_order_result(
             self._request("POST", "/fapi/v1/order", sl_params, signed=True),

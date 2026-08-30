@@ -10,9 +10,16 @@ from src.engine import TradingEngine
 from src.utils.logger import get_logger
 from src.utils.notifier import TelegramNotifier
 
-POLL_INTERVAL_SECONDS = 60 * 60   # timeframe strategi produksi (BTC 1H)
+POLL_INTERVAL_SECONDS = 3600       # default fallback 1H (BTC 1H)
 CANDLE_CLOSE_BUFFER_SECONDS = 300  # jeda setelah close candle (data siap di API)
 KILL_SWITCH_CHECK_SECONDS = 60    # monitoring kill switch antar-poll
+
+# Mapping timeframe ke detik (untuk hitung poll interval dinamis)
+_TF_TO_SECONDS = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800,
+    "12h": 43200, "1d": 86400,
+}
 
 log = get_logger("main")
 
@@ -44,8 +51,11 @@ def build_engine(config: Config) -> tuple[TradingEngine, TelegramNotifier, objec
     limits       = RiskLimits(
         max_leverage=config.max_leverage,
         max_daily_loss_pct=config.max_daily_loss_pct,
+        tpsl_mode=config.tpsl_mode,
         atr_sl_mult=config.atr_sl_mult,
         tp_rr_ratio=config.tp_rr_ratio,
+        sl_pct=config.sl_pct,
+        tp_pct=config.tp_pct,
         risk_per_trade_pct=config.risk_per_trade_pct,
         use_trailing=config.trailing_enabled,
         trailing_start_atr_mult=config.trailing_start_atr_mult,
@@ -54,6 +64,7 @@ def build_engine(config: Config) -> tuple[TradingEngine, TelegramNotifier, objec
         dca_enabled=config.dca_enabled,
         dca_max_orders=config.dca_max_orders,
         dca_step_atr_mult=config.dca_step_atr_mult,
+        dca_step_pct=config.dca_step_pct,
         dca_lot_multiplier=config.dca_lot_multiplier,
         dca_tp_rr_ratio=config.dca_tp_rr_ratio,
         dca_hard_sl_equity_pct=config.dca_hard_sl_equity_pct,
@@ -82,6 +93,7 @@ def build_engine(config: Config) -> tuple[TradingEngine, TelegramNotifier, objec
         risk_manager=risk_manager,
         executor=executor,
         symbols=[config.symbol],
+        interval=config.trading_interval,
         notifier=notifier,
         ml_filter=ml_filter,
     )
@@ -153,13 +165,44 @@ def main():
     config = Config.from_env()
     engine, notifier, ml_filter = build_engine(config)
 
-    log.info("Agent Binance Futures mulai jalan (%s - %s)",
-             "TESTNET" if config.use_testnet else "MAINNET", config.symbol)
+    poll_interval = _TF_TO_SECONDS.get(config.trading_interval, 3600)
+    log.info(
+        "Agent Binance Futures mulai jalan (%s - %s) | TF=%s | TPSL=%s | DCA=%s",
+        "TESTNET" if config.use_testnet else "MAINNET",
+        config.symbol,
+        config.trading_interval.upper(),
+        config.tpsl_mode.upper(),
+        f"ON ({config.dca_max_orders} lapis)" if config.dca_enabled else "OFF",
+    )
 
     if args.dashboard:
         run_dashboard(engine, notifier, ml_filter)
     else:
-        run_plain(engine, notifier)
+        run_plain_with_interval(engine, notifier, poll_interval)
+
+
+def run_plain_with_interval(engine: TradingEngine, notifier: TelegramNotifier, poll_interval_s: int):
+    """Loop utama tanpa dashboard (mode log biasa), interval dinamis dari config."""
+    log.info("Agent Binance Futures mulai jalan (%s)",
+             "TESTNET" if engine.client.config.use_testnet else "MAINNET")
+
+    while True:
+        try:
+            engine.run_once()
+        except Exception as e:
+            log.error("Error saat run_once: %s", e)
+            notifier.notify_error("di run_once", e)
+
+        next_poll = time.time() + seconds_until_next_poll(poll_interval_s)
+        while True:
+            remaining = next_poll - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(KILL_SWITCH_CHECK_SECONDS, remaining))
+            try:
+                engine.monitor_kill_switch()
+            except Exception as e:
+                log.error("Error saat monitor kill switch: %s", e)
 
 
 if __name__ == "__main__":
