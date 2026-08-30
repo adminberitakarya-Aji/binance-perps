@@ -92,13 +92,28 @@ BTCUSDT — cara cepat cek kredensial & koneksi sebelum menjalankan agent penuh.
 
 ## Jalankan agent
 
-```bash
-python main.py
+Tersedia 3 mode eksekusi bot:
+
+### 1. Mode Desktop GUI Settings (MetaTrader 5 Style)
+Buka jendela antarmuka visual MT5 untuk mengubah seluruh parameter strategi, ML, DCA, TP/SL, dan Risk:
+```powershell
+.venv\Scripts\python.exe main.py --settings
+```
+*(atau alias: `.venv\Scripts\python.exe main.py --gui`)*
+
+### 2. Mode Terminal Visual Dashboard (Rich HUD)
+Jalankan bot live dengan tampilan Dashboard Terminal Visual real-time (Header HUD, Sinyal & Indikator, ML Onnx probability bar, Position & DCA Lapis Status, Feed log):
+```powershell
+.venv\Scripts\python.exe main.py --dashboard
+```
+*(atau alias: `.venv\Scripts\python.exe main.py --ui`)*
+
+### 3. Mode Log Standar (Headless / Background / VPS)
+```powershell
+.venv\Scripts\python.exe main.py
 ```
 
-Default jalan di **testnet** dan poll selaras close candle 1H (+5 menit buffer). Ganti
-`BINANCE_USE_TESTNET=false` di `.env` hanya setelah kamu yakin dengan hasil
-backtest & paper trading.
+Default berjalan di **testnet** dan polling otomatis selaras dengan close candle sesuai `TRADING_INTERVAL` di `.env` (+buffer). Ganti `BINANCE_USE_TESTNET=false` di `.env` hanya setelah Anda yakin dengan hasil uji testnet.
 
 ## Ganti strategi
 
