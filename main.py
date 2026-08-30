@@ -146,4 +146,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[INFO] Bot dihentikan oleh user (Ctrl+C). Keluar dengan aman.")
+
