@@ -51,13 +51,19 @@ class MockClient:
         self.config = SimpleNamespace(use_testnet=True)  # dipakai heartbeat engine
 
     def get_account_state(self):
-        return {"marginSummary": {"accountValue": self.equity}}
+        return {"totalMarginBalance": self.equity}
 
     def get_position(self, symbol):
         return None
 
     def get_mid_price(self, symbol):
         return MID_PRICE
+
+    def round_size(self, symbol, size):
+        return round(size, 4)
+
+    def round_price(self, symbol, price):
+        return round(price, 2)
 
     def cancel_all_trigger_orders(self, symbol):
         pass

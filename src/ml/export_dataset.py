@@ -31,9 +31,9 @@ from src.backtest.run_backtest import load_candles
 from src.risk.manager import RiskLimits
 from src.strategy.trend_reversal import TrendReversalStrategy
 
-FEE_RATE = 0.00035          # taker Hyperliquid per sisi
+FEE_RATE = 0.0005           # taker Binance USDⓈ-M Futures per sisi (0.05%)
 SLIPPAGE = 0.0002           # per sisi, konservatif
-FUNDING_HOURLY = 0.000009   # mean |rate| BTC, Mar-Agu 2026
+FUNDING_HOURLY = 0.0000125  # estimasi rate per jam (Binance rate 8-jam ~0.0001 / 8)
 HORIZON = 30                # bar ke depan, sama dgn Export_ML_Dataset.mq5
 
 FEATURE_COLS = [
@@ -344,9 +344,9 @@ def build_dataset(candles: list, strategy: TrendReversalStrategy,
 
 def main():
     ap = argparse.ArgumentParser(description="Ekspor dataset ML (replikasi Export_ML_Dataset.mq5)")
-    ap.add_argument("--file", default="data/BTCUSDT_15m_ext.csv", help="CSV candle (t,o,h,l,c,v)")
-    ap.add_argument("--symbol", default="BTC")
-    ap.add_argument("--interval", default="15m", help="interval candle sumber")
+    ap.add_argument("--file", default="data/BTCUSDT_1h.csv", help="CSV candle (t,o,h,l,c,v)")
+    ap.add_argument("--symbol", default="BTCUSDT")
+    ap.add_argument("--interval", default="1h", help="interval candle sumber")
     ap.add_argument("--resample-to", default=None, help="opsional: resample ke interval lebih besar (mis. 1h)")
     ap.add_argument("--out", default=None, help="path output CSV")
     ap.add_argument("--adx-strength", type=float, default=15.0)

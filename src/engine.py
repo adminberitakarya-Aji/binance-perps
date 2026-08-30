@@ -2,7 +2,7 @@ import json
 import os
 from datetime import datetime, timezone
 
-from src.client import HyperliquidClient
+from src.client import BinanceFuturesClient
 from src.data.market_data import fetch_snapshot
 from src.strategy.base import MarketSnapshot, Signal, Strategy
 from src.risk.manager import RiskManager
@@ -16,7 +16,7 @@ log = get_logger("engine")
 class TradingEngine:
     def __init__(
         self,
-        client: HyperliquidClient,
+        client: BinanceFuturesClient,
         strategy: Strategy,
         risk_manager: RiskManager,
         executor: OrderExecutor,
@@ -84,14 +84,15 @@ class TradingEngine:
             log.error("gagal menyimpan daily state: %s", e)
 
     def _get_equity_or_none(self) -> float | None:
-        """Equity asli (marginSummary.accountValue); None kalau kosong/gagal.
-
-        Dipakai tracker harian: nilai fallback TIDAK boleh dipakai di sini
-        supaya PnL harian tidak pernah dihitung dari angka palsu.
-        """
+        """Equity asli dari totalMarginBalance Binance; None kalau kosong/gagal."""
         try:
             state = self.client.get_account_state()
-            account_value = float(state.get("marginSummary", {}).get("accountValue", 0) or 0)
+            account_value = float(
+                state.get("totalMarginBalance", 0)
+                or state.get("totalWalletBalance", 0)
+                or state.get("marginSummary", {}).get("accountValue", 0)  # fallback kompatibilitas
+                or 0
+            )
             if account_value <= 0:
                 return None
             return account_value
@@ -100,15 +101,7 @@ class TradingEngine:
             return None
 
     def _update_daily_pnl(self):
-        """Hitung PnL harian (basis hari UTC) -> suntikkan ke risk_manager.
-
-        - Ganti hari UTC -> day_start_equity di-reset (baseline baru hari itu).
-        - Equity tidak tersedia (wallet kosong / API gagal) -> tracker TIDAK
-          di-update (nilai terakhir dipertahankan, supaya kill switch tidak
-          dibuka/ditutup oleh data kosong -> tidak ada PnL palsu).
-        - Kill switch memblokir ENTRY baru saja; posisi terbuka tetap
-          dikelola penuh (SL/TP/trailing tetap jalan).
-        """
+        """Hitung PnL harian (basis hari UTC) -> suntikkan ke risk_manager."""
         equity = self._get_equity_or_none()
         if equity is None:
             log.info("equity tidak tersedia -> tracker PnL harian tidak di-update")
@@ -117,7 +110,6 @@ class TradingEngine:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         if self.daily_state.get("date_utc") != today:
-            # PnL final "kemarin" = equity saat rollover vs baseline kemarin
             yesterday_pnl_pct = None
             old_baseline = float(self.daily_state.get("day_start_equity") or 0)
             if old_baseline > 0:
@@ -131,8 +123,6 @@ class TradingEngine:
             self._save_daily_state()
             log.info("tracker harian reset: date=%s baseline_equity=%.2f", today, equity)
 
-            # heartbeat = bukti bot hidup + ringkasan awal hari (kirim SEKALI
-            # per hari, terikat deteksi rollover yang persisted)
             try:
                 positions = []
                 for sym, st in self.live_positions.items():
@@ -151,7 +141,7 @@ class TradingEngine:
                 log.warning("gagal kirim heartbeat: %s", e)
 
         day_start = float(self.daily_state.get("day_start_equity") or 0)
-        if day_start <= 0:  # state korup -> pulihkan baseline
+        if day_start <= 0:
             self.daily_state["day_start_equity"] = equity
             self._save_daily_state()
             day_start = equity
@@ -179,22 +169,16 @@ class TradingEngine:
             )
 
     def run_once(self):
-        # PnL harian (kill switch) di-update SEKALI per run, bukan per symbol
         self._update_daily_pnl()
 
         for symbol in self.symbols:
             # --- A. Kelola posisi terbuka dulu (trailing + cleanup) ---
             self._manage_open_positions(symbol)
 
-            # fetch secukupnya sesuai kebutuhan strategi (bug lama: fetch
-            # 50 bar padahal strategi butuh 52 -> selalu HOLD di live)
             need = self.strategy.required_bars()
-            # fitur ML butuh window panjang: regime 500 bar + vol SMA100 + buffer
             lookback = max(need + 10, 560)
             snapshot = fetch_snapshot(self.client, symbol, interval=self.interval, lookback_candles=lookback)
 
-            # guard: jangan entry kalau masih ada posisi terbuka di simbol ini
-            # (satu posisi per simbol; backtest juga single-position)
             pos = self.client.get_position(symbol)
             if pos is not None:
                 log.info("[%s] skip entry: masih ada posisi terbuka (%s, szi=%s)", symbol, pos["side"], pos["szi"])
@@ -211,23 +195,15 @@ class TradingEngine:
             if self.ml_filter is not None:
                 funding_rate = self.client.get_funding_rate(symbol)
                 window = snapshot.candles if hasattr(snapshot, "candles") else []
-                if not self.ml_filter.allow(window, result.signal,
-                                            self.strategy, funding_rate):
-                    log.info("[%s] sinyal %s DITOLAK filter ML (fail-closed)",
-                             symbol, result.signal.value)
+                if not self.ml_filter.allow(window, result.signal, self.strategy, funding_rate):
+                    log.info("[%s] sinyal %s DITOLAK filter ML (fail-closed)", symbol, result.signal.value)
                     continue
 
-            # Indikator dihitung SEKALI per siklus (fix P2-15: sebelumnya
-            # _to_df/_compute_indicators dijalankan 3x -- untuk sl_distance,
-            # ATR, dan internal strategi).
             atr = self._get_last_atr(snapshot)
             sl_distance_pct = None
             if atr is not None and atr > 0 and snapshot.mid_price > 0:
                 sl_distance_pct = (atr * self.risk_manager.limits.atr_sl_mult) / snapshot.mid_price
 
-            # Fail-closed: sizing HANYA dari equity ASLI. Tanpa fallback angka
-            # palsu -- equity fiktif (mis. 1000 saat saldo 100) menghasilkan
-            # notional oversize -> risiko liquidation.
             equity_usd = self._get_equity_or_none()
             if equity_usd is None:
                 log.error("[%s] equity tidak tersedia -> skip entry (fail-closed)", symbol)
@@ -257,7 +233,7 @@ class TradingEngine:
                         "posisi %s dicatat: side=%s SL=%s TP=%s",
                         symbol, self.live_positions[symbol]["side"], sl, tp,
                     )
-                    size_asset = round(size_usd / snapshot.mid_price, 5)
+                    size_asset = self.client.round_size(symbol, size_usd / snapshot.mid_price)
                     self.notifier.notify_entry(
                         symbol=symbol,
                         signal=result.signal.value,
@@ -278,7 +254,7 @@ class TradingEngine:
         state = self.live_positions.get(symbol)
         pos = self.client.get_position(symbol)
 
-        # posisi sudah tertutup (SL/TP terisi atau manual) -> bersihkan
+        # posisi sudah tertutup -> bersihkan
         if pos is None:
             if state is not None:
                 log.info("[%s] posisi sudah tertutup -> hapus state & cancel trigger sisa", symbol)
@@ -297,11 +273,9 @@ class TradingEngine:
                 log.warning("[%s] cleanup trigger gagal: %s", symbol, e)
             return
 
-        # posisi ada tapi state hilang (entry manual / crash sebelum save):
-        # rekonstruksi state minimal supaya cleanup & guard tetap bekerja.
-        # Trailing TIDAK aktif untuk posisi tanpa entry_atr.
+        # posisi ada tapi state hilang: rekonstruksi state minimal
         if state is None:
-            log.warning("[%s] posisi terbuka tanpa state -> rekonstruksi state minimal (trailing nonaktif untuk posisi ini)", symbol)
+            log.warning("[%s] posisi terbuka tanpa state -> rekonstruksi state minimal (trailing nonaktif)", symbol)
             self.live_positions[symbol] = {
                 "side": pos["side"],
                 "entry_price": pos["entryPx"],
@@ -310,22 +284,14 @@ class TradingEngine:
                 "tp": None,
             }
             self._save_state()
-            # alert: trailing mati permanen untuk posisi ini (fix P2-16) --
-            # user perlu tahu proteksi live sekarang hanya SL/TP pair di
-            # exchange (kalau ada) tanpa penguncian profit otomatis.
             self.notifier.notify_error(
-                f"Posisi {symbol} terbuka TANPA state (entry manual/crash?) -> "
-                f"state direkonstruksi, trailing NONAKTIF untuk posisi ini "
+                f"Posisi {symbol} terbuka TANPA state -> state direkonstruksi, trailing NONAKTIF "
                 f"(side={pos['side']}, szi={pos['szi']})",
                 Exception("position state missing"),
             )
             return
 
         # --- SL guard (self-healing): posisi TIDAK boleh telanjang ---
-        # SL trigger wajib ada di exchange untuk state yang punya SL. Kalau
-        # hilang (cancel parsial saat trailing, crash di antara cancel-replace,
-        # dsb.): pasang ulang pair dari state -> kalau gagal juga, tutup paksa
-        # + alert. Jangan pernah cuma log dan membiarkan posisi tanpa SL.
         trigger_active = self.client.get_trigger_orders(symbol)
         sl_active = next((o for o in trigger_active if str(o.get("triggerCondition", "")).startswith("sl")), None)
         if state.get("sl") is not None and sl_active is None:
@@ -338,7 +304,7 @@ class TradingEngine:
                     f"SL {symbol} hilang di exchange & sudah dipasang ulang (SL={state['sl']})",
                     Exception("SL trigger missing"),
                 )
-                return  # pair baru terpasang; trailing dilanjutkan siklus berikutnya
+                return
             except Exception as e:
                 log.critical("[%s] gagal pasang ulang SL (%s) -> TUTUP PAKSA posisi", symbol, e)
                 try:
@@ -353,7 +319,7 @@ class TradingEngine:
                 )
                 return
 
-        # --- trailing stop (ala risk_manager.compute_trailing_sl) ---
+        # --- trailing stop ---
         if self.risk_manager.limits.use_trailing and state.get("entry_atr") and state.get("sl") is not None:
             signal = Signal.BUY if state["side"] == "B" else Signal.SELL
             entry_price = state["entry_price"]
@@ -364,10 +330,8 @@ class TradingEngine:
                 signal, entry_price, best_px, state["sl"], entry_atr
             )
             if new_sl is None or abs(new_sl - state["sl"]) < 1e-9:
-                return  # belum saatnya / pergeseran belum melewati step
+                return
 
-            # modify SL in-place (P2-9): TIDAK ada cancel->replace, jadi tidak
-            # ada window tanpa SL. TP tidak berubah -> tidak disentuh.
             old_sl = state["sl"]
             close_is_buy = state["side"] == "S"
             try:
@@ -394,43 +358,19 @@ class TradingEngine:
                     self.notifier.notify_force_close_trailing(symbol, state.get("sl"), best_px)
 
     def monitor_kill_switch(self):
-        """Cek PnL harian/kill switch DI LUAR siklus poll utama (fix P2-10).
-
-        Dipanggil berkala (tiap ~60 detik) dari loop utama supaya kill switch
-        terpicu & alert terkirim segera, bukan menunggu poll 1 jam berikutnya.
-        Idempotent: rollover & heartbeat tetap terikat deteksi pergantian hari
-        (persisted), jadi tidak ada notifikasi ganda. Kill switch hanya
-        MEMBLOKIR entry baru; posisi terbuka tetap dikelola SL/TP/trailing.
-        """
+        """Cek PnL harian/kill switch di luar siklus poll utama."""
         self._update_daily_pnl()
 
     def _get_last_atr(self, snapshot: MarketSnapshot) -> float | None:
-        """ATR terakhir dari candle closed (untuk SL/TP entry live)."""
+        """ATR terakhir dari candle closed."""
         try:
             strategy = self.strategy
             if hasattr(strategy, "_to_df") and hasattr(strategy, "_compute_indicators"):
                 df = strategy._to_df(snapshot.candles)
                 df = strategy._compute_indicators(df)
                 last_atr = df["atr"].iloc[-1]
-                if last_atr == last_atr:  # NaN check
+                if last_atr == last_atr:
                     return float(last_atr)
         except Exception as e:
             log.warning("gagal hitung ATR: %s", e)
-        return None
-
-    def _get_sl_distance_pct(self, snapshot: MarketSnapshot) -> float | None:
-        """DEPRECATED: dipertahankan hanya sebagai util; jarak SL entry
-        sekarang dihitung SEKALI per siklus di run_once (fix P2-15)."""
-        try:
-            strategy = self.strategy
-            if hasattr(strategy, "_to_df") and hasattr(strategy, "_compute_indicators"):
-                df = strategy._to_df(snapshot.candles)
-                df = strategy._compute_indicators(df)
-                last_atr = df["atr"].iloc[-1]
-                if last_atr == last_atr:  # NaN check
-                    atr = float(last_atr)
-                    if atr > 0 and snapshot.mid_price > 0:
-                        return (atr * self.risk_manager.limits.atr_sl_mult) / snapshot.mid_price
-        except Exception as e:
-            log.warning("gagal hitung ATR untuk sizing: %s", e)
         return None

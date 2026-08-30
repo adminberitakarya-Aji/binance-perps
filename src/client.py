@@ -1,14 +1,17 @@
 """
-Wrapper tipis di atas hyperliquid-python-sdk.
-Menyatukan Info (baca data publik) dan Exchange (kirim order, butuh signing)
-jadi satu titik akses, supaya modul lain tidak perlu tahu detail SDK.
+Wrapper REST API Binance USDⓈ-M Futures (fapi).
+Menyatukan query data publik (klines, ticker, exchangeInfo) dan eksekusi order
+(signing HMAC-SHA256, SL/TP conditional orders, account/positions) dalam satu
+titik akses mandiri tanpa dependensi SDK pihak ketiga yang berat.
 """
 
+import hashlib
+import hmac
+import math
 import time
+from urllib.parse import urlencode
 
-import eth_account
-from hyperliquid.info import Info
-from hyperliquid.exchange import Exchange
+import requests
 
 from src.config import Config
 from src.utils.logger import get_logger
@@ -16,152 +19,227 @@ from src.utils.logger import get_logger
 log = get_logger("client")
 
 
-def round_px(px: float, sz_decimals: int, is_spot: bool = False) -> float:
-    """Bulatkan harga sesuai aturan presisi Hyperliquid: maks (6 - szDecimals)
-    desimal untuk perps (8 - szDecimals untuk spot) dan maks 5 significant
-    figures.
-
-    `exchange.bulk_orders` SDK TIDAK membulatkan harga otomatis (berbeda dari
-    market_open/market_close yang memakai _slippage_price), jadi trigger order
-    SL/TP yang dikirim manual WAJIB dibulatkan lewat fungsi ini -- kalau tidak
-    (mis. BTC 2 desimal = 7 sig-fig), exchange menolak order.
-    Pola rounding identik dengan hyperliquid.exchange._slippage_price.
-    """
-    max_decimals = (8 if is_spot else 6) - sz_decimals
-    return round(float(f"{px:.5g}"), max_decimals)
+def _get_precision(val: float) -> int:
+    """Hitung jumlah desimal dari step/tick size (mis. 0.001 -> 3, 0.1 -> 1, 1.0 -> 0)."""
+    s = f"{val:.10f}".rstrip("0")
+    if "." in s:
+        return len(s.split(".")[1])
+    return 0
 
 
-def round_sz(sz: float, sz_decimals: int) -> float:
-    """Bulatkan UKURAN order (bukan harga) ke szDecimals asli aset.
+def round_px_binance(px: float, tick_size: float) -> float:
+    """Bulatkan harga ke kelipatan tickSize terdekat."""
+    if tick_size <= 0:
+        return px
+    decimals = _get_precision(tick_size)
+    steps = round(px / tick_size)
+    rounded = steps * tick_size
+    return round(rounded, decimals)
 
-    Beda dari round_px: ukuran tidak punya batas 5 significant figures,
-    cuma dibatasi jumlah desimal (szDecimals) -- tapi tetap WAJIB dibulatkan,
-    karena hardcode desimal (mis. selalu 5) salah untuk aset yang szDecimals
-    aslinya lebih kecil (banyak altcoin < 5) -> exchange menolak order,
-    persis pola kegagalan yang sama dengan harga yang tidak di-round_px.
-    """
-    return round(sz, sz_decimals)
+
+def round_sz_binance(sz: float, step_size: float) -> float:
+    """Bulatkan ukuran (quantity) ke kelipatan stepSize terdekat."""
+    if step_size <= 0:
+        return sz
+    decimals = _get_precision(step_size)
+    steps = math.floor(sz / step_size + 1e-9)
+    rounded = steps * step_size
+    return round(rounded, decimals)
 
 
 class OrderRejectedError(RuntimeError):
-    """Exchange MENOLAK order (status err / per-order error).
-
-    SDK hyperliquid TIDAK me-raise exception untuk order yang ditolak -- ia
-    mengembalikan dict {'status': 'err', ...} atau status ok dengan elemen
-    'error' per order. Tanpa validasi eksplisit, order gagal terlihat sukses
-    dan engine mencatat state posisi fantasi.
-    """
-
-
-def validate_order_result(result, context: str = "order"):
-    """Validasi respons order SDK; raise OrderRejectedError kalau ditolak.
-
-    Bentuk respons:
-      {'status': 'err', 'response': '...'}                        -> ditolak
-      {'status': 'ok', 'response': {'data': {'statuses': [
-          {'resting': {...}} | {'filled': {...}} | {'error': '...'}
-      ]}}}                                                        -> cek per order
-    Return result apa adanya kalau valid.
-    """
-    if not isinstance(result, dict):
-        raise OrderRejectedError(f"{context}: respons tidak dikenal: {result!r}")
-    status = result.get("status")
-    if status == "err":
-        raise OrderRejectedError(f"{context} ditolak: {result.get('response')}")
-    if status == "ok":
-        statuses = (
-            result.get("response", {}).get("data", {}).get("statuses", [])
-        )
-        for st in statuses:
-            if isinstance(st, dict) and "error" in st:
-                raise OrderRejectedError(f"{context} ditolak: {st['error']}")
-            elif isinstance(st, str) and "error" in st.lower():
-                raise OrderRejectedError(f"{context} ditolak: {st}")
-    return result
+    """Exchange MENOLAK order (error code dari Binance)."""
 
 
 class ProtectionError(RuntimeError):
-    """Entry terisi tapi SL/TP gagal dipasang -> posisi SUDAH ditutup paksa.
-
-    Dilempar ke executor supaya alert force-close terkirim (jalur engine
-    sendiri tidak tahu proteksi gagal).
-    """
+    """Entry terisi tapi SL/TP gagal dipasang -> posisi SUDAH ditutup paksa."""
 
 
-class HyperliquidClient:
-    def __init__(self, config: Config):
+def validate_order_result(result, context: str = "order"):
+    """Validasi respons order Binance; raise OrderRejectedError kalau ditolak."""
+    if not isinstance(result, dict):
+        raise OrderRejectedError(f"{context}: respons tidak dikenal: {result!r}")
+    if "code" in result and int(result["code"]) < 0:
+        msg = result.get("msg", "Unknown error")
+        raise OrderRejectedError(f"{context} ditolak (code={result['code']}): {msg}")
+    if result.get("status") in ("REJECTED", "EXPIRED"):
+        raise OrderRejectedError(f"{context} ditolak dengan status: {result.get('status')}")
+    return result
+
+
+class BinanceFuturesClient:
+    def __init__(self, config: Config, session: requests.Session | None = None):
         self.config = config
-        self.wallet = eth_account.Account.from_key(config.private_key)
+        self.base_url = config.api_url.rstrip("/")
+        self.session = session or requests.Session()
+        self.session.headers.update({
+            "X-MBX-APIKEY": config.api_key,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "BinanceFuturesAgent/1.0",
+        })
+        self._exchange_info_cache: dict = {}
+        self._symbol_filters: dict = {}
 
-        # Info: query market data, posisi, order book, funding rate, dll.
-        self.info = Info(config.api_url, skip_ws=True)
+    # ------------------------------------------------------------------
+    # HTTP & Signature Helpers
+    # ------------------------------------------------------------------
+    def _sign(self, params: dict) -> str:
+        query_string = urlencode(params)
+        signature = hmac.new(
+            self.config.api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return signature
 
-        # Exchange: kirim order, cancel, adjust leverage. Butuh wallet untuk sign.
-        self.exchange = Exchange(
-            self.wallet,
-            config.api_url,
-            account_address=config.account_address,
-        )
+    def _request(self, method: str, path: str, params: dict | None = None, signed: bool = False) -> dict | list:
+        url = f"{self.base_url}{path}"
+        payload = dict(params or {})
 
+        if signed:
+            payload["timestamp"] = int(time.time() * 1000)
+            payload["recvWindow"] = 5000
+            payload["signature"] = self._sign(payload)
+
+        try:
+            if method.upper() == "GET":
+                resp = self.session.get(url, params=payload, timeout=15)
+            elif method.upper() == "POST":
+                resp = self.session.post(url, data=payload, timeout=15)
+            elif method.upper() == "DELETE":
+                resp = self.session.delete(url, params=payload, timeout=15)
+            elif method.upper() == "PUT":
+                resp = self.session.put(url, data=payload, timeout=15)
+            else:
+                raise ValueError(f"Metode HTTP tidak didukung: {method}")
+
+            data = resp.json()
+            if isinstance(data, dict) and "code" in data and int(data["code"]) < 0:
+                log.warning("Binance API error [%s %s]: %s", method, path, data)
+            return data
+        except Exception as e:
+            log.error("HTTP request gagal [%s %s]: %s", method, path, e)
+            raise
+
+    # ------------------------------------------------------------------
+    # Exchange Info & Precision Filtering
+    # ------------------------------------------------------------------
+    def load_exchange_info(self, symbol: str | None = None) -> dict:
+        """Fetch exchangeInfo dan simpan cache filter (tickSize, stepSize, minNotional)."""
+        data = self._request("GET", "/fapi/v1/exchangeInfo")
+        if isinstance(data, dict) and "symbols" in data:
+            self._exchange_info_cache = data
+            for s in data["symbols"]:
+                sym = s.get("symbol")
+                filters = {}
+                for f in s.get("filters", []):
+                    f_type = f.get("filterType")
+                    if f_type == "PRICE_FILTER":
+                        filters["tickSize"] = float(f.get("tickSize", 0.1))
+                    elif f_type == "LOT_SIZE":
+                        filters["stepSize"] = float(f.get("stepSize", 0.001))
+                        filters["minQty"] = float(f.get("minQty", 0.001))
+                    elif f_type in ("MIN_NOTIONAL", "NOTIONAL"):
+                        filters["minNotional"] = float(f.get("notional", f.get("minNotional", 5.0)))
+                self._symbol_filters[sym] = filters
+        return self._symbol_filters.get(symbol or self.config.symbol, {})
+
+    def get_symbol_filters(self, symbol: str) -> dict:
+        if symbol not in self._symbol_filters:
+            self.load_exchange_info(symbol)
+        return self._symbol_filters.get(symbol, {"tickSize": 0.1, "stepSize": 0.001, "minNotional": 5.0})
+
+    def round_price(self, symbol: str, price: float) -> float:
+        filters = self.get_symbol_filters(symbol)
+        tick_size = filters.get("tickSize", 0.1)
+        return round_px_binance(price, tick_size)
+
+    def round_size(self, symbol: str, size: float) -> float:
+        filters = self.get_symbol_filters(symbol)
+        step_size = filters.get("stepSize", 0.001)
+        return round_sz_binance(size, step_size)
+
+    # ------------------------------------------------------------------
+    # Market Data
+    # ------------------------------------------------------------------
     def get_mid_price(self, symbol: str) -> float:
-        mids = self.info.all_mids()
-        return float(mids[symbol])
+        data = self._request("GET", "/fapi/v1/ticker/bookTicker", {"symbol": symbol})
+        if isinstance(data, dict) and "bidPrice" in data and "askPrice" in data:
+            bid = float(data["bidPrice"])
+            ask = float(data["askPrice"])
+            return (bid + ask) / 2.0
+        # fallback to price ticker
+        pdata = self._request("GET", "/fapi/v1/ticker/price", {"symbol": symbol})
+        return float(pdata["price"])
 
-    def get_candles(self, symbol: str, interval: str, start_ms: int, end_ms: int) -> list:
-        """interval contoh: '1m', '5m', '15m', '1h', '4h', '1d'"""
-        return self.info.candles_snapshot(symbol, interval, start_ms, end_ms)
+    def get_candles(self, symbol: str, interval: str, start_ms: int, end_ms: int, limit: int = 1500) -> list:
+        """interval: '1m', '5m', '15m', '1h', '4h', '1d'.
+        Konversi ke format dict {t, T, o, h, l, c, v, n} yang konsisten.
+        """
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "limit": limit,
+        }
+        rows = self._request("GET", "/fapi/v1/klines", params)
+        if not isinstance(rows, list):
+            return []
 
+        out = []
+        for r in rows:
+            out.append({
+                "t": int(r[0]),
+                "T": int(r[6]),
+                "o": float(r[1]),
+                "h": float(r[2]),
+                "l": float(r[3]),
+                "c": float(r[4]),
+                "v": float(r[5]),
+                "n": int(r[8]) if len(r) > 8 else 0,
+            })
+        return out
+
+    def get_funding_rate(self, symbol: str) -> float | None:
+        """Funding rate terakhir (rate 8 jam) dari Binance."""
+        try:
+            rows = self._request("GET", "/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1})
+            if isinstance(rows, list) and rows:
+                return float(rows[-1]["fundingRate"])
+            return None
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # Account & Positions
+    # ------------------------------------------------------------------
     def get_account_state(self) -> dict:
-        return self.info.user_state(self.config.account_address)
+        """State akun Binance Futures (v2/account)."""
+        data = self._request("GET", "/fapi/v2/account", signed=True)
+        return data if isinstance(data, dict) else {}
 
     def get_open_positions(self) -> list:
-        state = self.get_account_state()
-        return state.get("assetPositions", [])
+        """Daftar seluruh posisi akun dari positionRisk."""
+        data = self._request("GET", "/fapi/v2/positionRisk", signed=True)
+        return data if isinstance(data, list) else []
 
-    def place_market_order(
-        self,
-        symbol: str,
-        is_buy: bool,
-        size: float,
-        reduce_only: bool = False,
-        sl: float | None = None,
-        tp: float | None = None,
-    ):
-        """Order market via helper SDK.
-
-        Kalau sl/tp diberikan (dan bukan reduce_only): setelah entry terisi,
-        pasang pasangan SL/TP (normalTpsl) sesuai ukuran posisi AKTUAL.
-        Kalau proteksi gagal total -> posisi ditutup paksa: engine ini tidak
-        pernah meninggalkan posisi telanjang tanpa stop-loss.
+    def get_position(self, symbol: str) -> dict | None:
+        """Posisi terbuka satu simbol.
+        Return {"szi": float (+long/-short), "entryPx": float, "side": "B"/"S"} atau None.
         """
-        if reduce_only:
-            return self.exchange.market_close(symbol)
-
-        result = validate_order_result(
-            self.exchange.market_open(symbol, is_buy, size), f"entry {symbol}"
-        )
-
-        if sl is None and tp is None:
-            return result
-
-        pos = self.get_position_retry(symbol)
-        if pos is None:
-            raise ProtectionError(
-                f"posisi {symbol} tidak terdeteksi setelah entry -- SL/TP gagal dipasang"
-            )
-
-        close_is_buy = pos["side"] == "S"  # menutup posisi = arah berlawanan
-        try:
-            self.place_tpsl_pair(symbol, close_is_buy, abs(pos["szi"]), sl, tp)
-        except Exception as e:
-            log.error("GAGAL pasang SL/TP (%s) -> tutup paksa posisi %s", e, symbol)
-            try:
-                self.cancel_all_trigger_orders(symbol)
-                self.exchange.market_close(symbol)
-            except Exception as e2:
-                log.critical("gagal tutup paksa %s: %s -- PERIKSA MANUAL!", symbol, e2)
-            raise
-        return result
+        positions = self.get_open_positions()
+        for p in positions:
+            if p.get("symbol") == symbol:
+                szi = float(p.get("positionAmt") or 0)
+                if abs(szi) < 1e-9:
+                    return None
+                return {
+                    "szi": szi,
+                    "entryPx": float(p.get("entryPrice") or 0),
+                    "side": "B" if szi > 0 else "S",
+                }
+        return None
 
     def get_position_retry(self, symbol: str, retries: int = 3, delay_s: float = 1.0) -> dict | None:
         """Posisi kadang belum terlihat sesaat setelah fill; retry ringan."""
@@ -172,146 +250,218 @@ class HyperliquidClient:
             time.sleep(delay_s)
         return self.get_position(symbol)
 
-    def _round_px(self, symbol: str, px: float) -> float:
-        """round_px() dengan szDecimals dari metadata exchange yang sudah
-        di-fetch Info di __init__ (butuh koneksi; fungsi murni round_px
-        dipisah supaya bisa dites tanpa jaringan)."""
-        asset = self.info.coin_to_asset[symbol]
-        sz_decimals = self.info.asset_to_sz_decimals[asset]
-        return round_px(px, sz_decimals, is_spot=asset >= 10_000)
-
-    def round_size(self, symbol: str, size: float) -> float:
-        """Bulatkan UKURAN order ke szDecimals asli aset (lihat round_sz()).
-
-        Dipakai executor.py sebelum kirim entry order -- size dari
-        size_usd/price bisa berdesimal berapapun, dan szDecimals BEDA per
-        aset (BTC/ETH kebetulan >= 5, tapi banyak aset lain lebih kecil ->
-        hardcode 5 desimal akan ditolak exchange untuk aset seperti itu)."""
-        asset = self.info.coin_to_asset[symbol]
-        sz_decimals = self.info.asset_to_sz_decimals[asset]
-        return round_sz(size, sz_decimals)
-
-    def place_tpsl_pair(self, symbol: str, close_is_buy: bool, size: float, sl: float, tp: float | None = None):
-        """Pasang SL (+TP) reduce-only, grouping normalTpsl: kalau salah satu
-        trigger terisi, satunya otomatis di-cancel oleh exchange.
-
-        Harga dibulatkan dulu ke presisi yang diterima exchange (round_px):
-        bulk_orders tidak membulatkan otomatis, harga mentah dengan desimal
-        berlebih akan DITOLAK -> ProtectionError -> force-close percuma.
-
-        close_is_buy = arah order PENUTUP (posisi long -> close_is_buy=False).
+    # ------------------------------------------------------------------
+    # Orders & Execution
+    # ------------------------------------------------------------------
+    def place_market_order(
+        self,
+        symbol: str,
+        is_buy: bool,
+        size: float,
+        reduce_only: bool = False,
+        sl: float | None = None,
+        tp: float | None = None,
+    ):
+        """Order market entry atau close.
+        Jika sl/tp diberikan: pasang STOP_MARKET dan TAKE_PROFIT_MARKET setelah entry terisi.
+        Jika proteksi gagal: posisi ditutup paksa (ProtectionError).
         """
-        sl = self._round_px(symbol, sl)
-        if tp is not None and tp > 0:
-            tp = self._round_px(symbol, tp)
-        orders = [
-            {
-                "coin": symbol,
-                "is_buy": close_is_buy,
-                "sz": size,
-                "limit_px": sl,
-                "order_type": {"trigger": {"triggerPx": sl, "isMarket": True, "tpsl": "sl"}},
-                "reduce_only": True,
-            }
-        ]
-        grouping = "na"
-        if tp is not None and tp > 0:
-            orders.append(
-                {
-                    "coin": symbol,
-                    "is_buy": close_is_buy,
-                    "sz": size,
-                    "limit_px": tp,
-                    "order_type": {"trigger": {"triggerPx": tp, "isMarket": True, "tpsl": "tp"}},
-                    "reduce_only": True,
-                }
+        if reduce_only:
+            return self.market_close_position(symbol)
+
+        side = "BUY" if is_buy else "SELL"
+        qty = self.round_size(symbol, size)
+
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": qty,
+        }
+        res = validate_order_result(
+            self._request("POST", "/fapi/v1/order", params, signed=True),
+            f"entry {symbol}",
+        )
+
+        if sl is None and tp is None:
+            return res
+
+        pos = self.get_position_retry(symbol)
+        if pos is None:
+            raise ProtectionError(
+                f"posisi {symbol} tidak terdeteksi setelah entry -- SL/TP gagal dipasang"
             )
-            grouping = "normalTpsl"
-        result = validate_order_result(
-            self.exchange.bulk_orders(orders, grouping=grouping),
-            f"SL/TP {symbol}",
-        )
-        return result
 
-    def modify_sl_trigger(self, symbol: str, oid: int, close_is_buy: bool, size: float, new_sl: float) -> dict:
-        """Geser trigger SL yang SUDAH terpasang via modify (fix P2-9).
-
-        modify_order mengubah order in-place: tidak ada jeda cancel->replace,
-        jadi tidak ada momen posisi telanjang tanpa SL. Harga WAJIB dibulatkan
-        _round_px dulu (bulk_modify juga tidak membulatkan otomatis).
-        """
-        new_sl = self._round_px(symbol, new_sl)
-        order_type = {"trigger": {"triggerPx": new_sl, "isMarket": True, "tpsl": "sl"}}
-        return validate_order_result(
-            self.exchange.modify_order(
-                int(oid), symbol, close_is_buy, size, new_sl, order_type, reduce_only=True
-            ),
-            f"modify SL {symbol}",
-        )
-
-    def market_close_position(self, symbol: str) -> dict:
-        """Tutup posisi market (reduce-only) via SDK."""
-        return validate_order_result(
-            self.exchange.market_close(symbol), f"market_close {symbol}"
-        )
-
-    def cancel_all_orders(self, symbol: str):
-        open_orders = self.info.open_orders(self.config.account_address)
-        for order in open_orders:
-            if order["coin"] == symbol:
-                self.exchange.cancel(symbol, order["oid"])
-
-    def get_funding_rate(self, coin: str) -> float | None:
-        """Funding rate terakhir (per jam) -- fitur ML & estimasi biaya."""
+        close_is_buy = pos["side"] == "S"
         try:
-            rows = self.info.funding_history(
-                coin, int(time.time() * 1000) - 3_600_000, int(time.time() * 1000)
+            self.place_tpsl_pair(symbol, close_is_buy, abs(pos["szi"]), sl, tp)
+        except Exception as e:
+            log.error("GAGAL pasang SL/TP (%s) -> tutup paksa posisi %s", e, symbol)
+            try:
+                self.cancel_all_trigger_orders(symbol)
+                self.market_close_position(symbol)
+            except Exception as e2:
+                log.critical("gagal tutup paksa %s: %s -- PERIKSA MANUAL!", symbol, e2)
+            raise ProtectionError(f"SL/TP gagal dipasang ({e}) -> posisi {symbol} ditutup paksa") from e
+
+        return res
+
+    def place_tpsl_pair(
+        self,
+        symbol: str,
+        close_is_buy: bool,
+        size: float,
+        sl: float,
+        tp: float | None = None,
+    ) -> list:
+        """Pasang STOP_MARKET (SL) dan opsional TAKE_PROFIT_MARKET (TP) reduce-only."""
+        close_side = "BUY" if close_is_buy else "SELL"
+        qty = self.round_size(symbol, size)
+        results = []
+
+        # 1. Stop Loss (STOP_MARKET)
+        sl_px = self.round_price(symbol, sl)
+        sl_params = {
+            "symbol": symbol,
+            "side": close_side,
+            "type": "STOP_MARKET",
+            "stopPrice": sl_px,
+            "quantity": qty,
+            "reduceOnly": "true",
+            "workingType": "MARK_PRICE",
+        }
+        sl_res = validate_order_result(
+            self._request("POST", "/fapi/v1/order", sl_params, signed=True),
+            f"SL {symbol}",
+        )
+        results.append(sl_res)
+
+        # 2. Take Profit (TAKE_PROFIT_MARKET)
+        if tp is not None and tp > 0:
+            tp_px = self.round_price(symbol, tp)
+            tp_params = {
+                "symbol": symbol,
+                "side": close_side,
+                "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": tp_px,
+                "quantity": qty,
+                "reduceOnly": "true",
+                "workingType": "MARK_PRICE",
+            }
+            tp_res = validate_order_result(
+                self._request("POST", "/fapi/v1/order", tp_params, signed=True),
+                f"TP {symbol}",
             )
-            return float(rows[-1]["fundingRate"]) if rows else None
-        except Exception:
-            return None
+            results.append(tp_res)
 
-    def get_position(self, symbol: str) -> dict | None:
-        """Posisi terbuka satu simbol, atau None.
-
-        Return {"szi": float bertanda (+long/-short), "entryPx": float, "side": "B"/"S"}.
-        Struktur assetPositions: [{"position": {"coin": ..., "szi": ..., ...}}, ...]
-        """
-        for p in self.get_open_positions():
-            pos = p.get("position", {})
-            if pos.get("coin") == symbol:
-                szi = float(pos.get("szi") or 0)
-                if szi == 0:
-                    return None
-                return {
-                    "szi": szi,
-                    "entryPx": float(pos.get("entryPx") or 0),
-                    "side": "B" if szi > 0 else "S",
-                }
-        return None
+        return results
 
     def get_trigger_orders(self, symbol: str) -> list:
-        """Trigger order aktif (SL/TP) satu simbol, dari frontendOpenOrders."""
-        orders = self.info.frontend_open_orders(self.config.account_address)
-        return [o for o in (orders or []) if o.get("coin") == symbol and o.get("isTrigger")]
+        """Conditional open orders (STOP_MARKET, TAKE_PROFIT_MARKET) satu simbol.
+        Menghasilkan list dict dengan key oid, triggerCondition, stopPrice agar kompatibel.
+        """
+        orders = self._request("GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
+        if not isinstance(orders, list):
+            return []
+
+        triggers = []
+        for o in orders:
+            o_type = o.get("type", "")
+            if o_type in ("STOP_MARKET", "STOP", "TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
+                is_sl = "STOP" in o_type
+                triggers.append({
+                    "oid": o.get("orderId"),
+                    "orderId": o.get("orderId"),
+                    "coin": symbol,
+                    "symbol": symbol,
+                    "type": o_type,
+                    "side": o.get("side"),
+                    "stopPrice": float(o.get("stopPrice") or 0),
+                    "triggerCondition": "sl" if is_sl else "tp",
+                    "origQty": float(o.get("origQty") or 0),
+                })
+        return triggers
+
+    def cancel_order(self, symbol: str, order_id: int | str) -> dict:
+        params = {"symbol": symbol, "orderId": order_id}
+        return self._request("DELETE", "/fapi/v1/order", params, signed=True)
 
     def cancel_all_trigger_orders(self, symbol: str) -> int:
-        """Cancel semua trigger order aktif satu simbol. Return jumlah yang dibatalkan."""
+        """Cancel semua trigger order aktif untuk satu simbol. Return jumlah yang dibatalkan."""
+        triggers = self.get_trigger_orders(symbol)
         n = 0
-        for o in self.get_trigger_orders(symbol):
+        for o in triggers:
             try:
-                self.exchange.cancel(symbol, int(o["oid"]))
+                self.cancel_order(symbol, o["oid"])
                 n += 1
             except Exception as e:
                 log.warning("gagal cancel trigger oid=%s: %s", o.get("oid"), e)
         return n
 
+    def modify_sl_trigger(
+        self,
+        symbol: str,
+        oid: int | str,
+        close_is_buy: bool,
+        size: float,
+        new_sl: float,
+    ) -> dict:
+        """Geser trigger SL: pasang SL baru terlebih dahulu, lalu batalkan SL lama."""
+        new_sl_px = self.round_price(symbol, new_sl)
+        close_side = "BUY" if close_is_buy else "SELL"
+        qty = self.round_size(symbol, size)
+
+        # Pasang SL baru
+        sl_params = {
+            "symbol": symbol,
+            "side": close_side,
+            "type": "STOP_MARKET",
+            "stopPrice": new_sl_px,
+            "quantity": qty,
+            "reduceOnly": "true",
+            "workingType": "MARK_PRICE",
+        }
+        new_res = validate_order_result(
+            self._request("POST", "/fapi/v1/order", sl_params, signed=True),
+            f"new SL {symbol}",
+        )
+
+        # Cancel SL lama
+        try:
+            self.cancel_order(symbol, oid)
+        except Exception as e:
+            log.warning("[%s] SL baru terpasang tapi gagal cancel SL lama oid=%s: %s", symbol, oid, e)
+
+        return new_res
+
+    def market_close_position(self, symbol: str) -> dict:
+        """Tutup posisi market segera (reduce-only)."""
+        pos = self.get_position(symbol)
+        if pos is None:
+            return {"status": "ok", "msg": "no open position"}
+
+        close_side = "SELL" if pos["side"] == "B" else "BUY"
+        qty = self.round_size(symbol, abs(pos["szi"]))
+
+        params = {
+            "symbol": symbol,
+            "side": close_side,
+            "type": "MARKET",
+            "quantity": qty,
+            "reduceOnly": "true",
+        }
+        return validate_order_result(
+            self._request("POST", "/fapi/v1/order", params, signed=True),
+            f"market_close {symbol}",
+        )
+
 
 if __name__ == "__main__":
-    # smoke test manual: pastikan koneksi ke testnet jalan
-    from src.config import Config
-
+    # Smoke test manual
     config = Config.from_env()
-    client = HyperliquidClient(config)
-    print(f"Terhubung ke {'TESTNET' if config.use_testnet else 'MAINNET'}")
-    print(f"Mid price BTC: {client.get_mid_price('BTC')}")
+    client = BinanceFuturesClient(config)
+    print(f"Terhubung ke Binance Futures ({'TESTNET' if config.use_testnet else 'MAINNET'})")
+    mid = client.get_mid_price(config.symbol)
+    print(f"Mid price {config.symbol}: {mid}")
+    filters = client.get_symbol_filters(config.symbol)
+    print(f"Filters {config.symbol}: {filters}")

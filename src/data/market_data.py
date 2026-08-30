@@ -1,5 +1,5 @@
 """
-Fetch candle & mid price dari Hyperliquid untuk jalur live.
+Fetch candle & mid price dari Binance USDⓈ-M Futures untuk jalur live.
 
 Anti-repaint: candle TERAKHIR dari API bisa jadi candle yang masih berjalan
 (belum close) -- kalau itu ikut dipakai sebagai "bar terkonfirmasi" oleh
@@ -10,15 +10,15 @@ strategi selalu menerima candle yang benar-benar sudah close.
 
 import time
 
-from src.client import HyperliquidClient
+from src.client import BinanceFuturesClient
 from src.strategy.base import MarketSnapshot
 
-# toleransi clock skew lokal vs server exchange (anti-repaint, P2-17)
+# toleransi clock skew lokal vs server exchange (anti-repaint)
 CLOCK_SKEW_GUARD_MS = 5_000
 
 
 def fetch_snapshot(
-    client: HyperliquidClient,
+    client: BinanceFuturesClient,
     symbol: str,
     interval: str = "1h",
     lookback_candles: int = 60,
@@ -30,11 +30,6 @@ def fetch_snapshot(
     candles = client.get_candles(symbol, interval, start_ms, now_ms)
 
     # drop candle yang masih berjalan (close time "T" di masa depan / >= now).
-    # Margin skew: jam lokal bisa selisih beberapa detik dari server HL --
-    # kalau jam lokal LEBIH CEPAT, candle yang masih berjalan bisa terlihat
-    # sudah close (T <= now) dan ikut dipakai -> repaint. Karena poll sudah
-    # +5 menit setelah close candle, menahan candle ekstra 5 detik tidak
-    # menunda apa pun (fix P2-17).
     if candles and int(candles[-1].get("T", 0)) > now_ms - CLOCK_SKEW_GUARD_MS:
         candles = candles[:-1]
 

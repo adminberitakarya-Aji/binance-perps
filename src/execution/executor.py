@@ -1,4 +1,4 @@
-from src.client import HyperliquidClient, ProtectionError
+from src.client import BinanceFuturesClient, ProtectionError
 from src.strategy.base import Signal
 from src.utils.logger import get_logger
 from src.utils.notifier import TelegramNotifier
@@ -7,12 +7,12 @@ log = get_logger("exec")
 
 
 class OrderExecutor:
-    """Kirim order final ke Hyperliquid dari jalur live."""
+    """Kirim order final ke Binance USDⓈ-M Futures dari jalur live."""
 
-    # Hyperliquid menolak order dengan notional < $10 per asset.
-    MIN_NOTIONAL_USD = 10.0
+    # Binance USDⓈ-M Futures minimum notional $5.0
+    MIN_NOTIONAL_USD = 5.0
 
-    def __init__(self, client: HyperliquidClient, notifier: TelegramNotifier | None = None):
+    def __init__(self, client: BinanceFuturesClient, notifier: TelegramNotifier | None = None):
         self.client = client
         # notifier default = no-op (mode silent)
         self.notifier = notifier or TelegramNotifier()

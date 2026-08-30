@@ -155,7 +155,7 @@ class EquityStubClient:
         self.equity = equity
 
     def get_account_state(self):
-        return {"marginSummary": {"accountValue": str(self.equity)}}
+        return {"totalMarginBalance": str(self.equity)}
 
 
 def test_monitor_kill_switch_triggers_immediately():

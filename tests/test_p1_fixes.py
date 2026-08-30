@@ -17,21 +17,21 @@ from types import SimpleNamespace
 # --- P1-5: validate_order_result -------------------------------------------
 from src.client import OrderRejectedError, validate_order_result
 
-OK_FILLED = {"status": "ok", "response": {"data": {"statuses": [{"filled": {"totalSz": "0.01"}}]}}}
-OK_RESTING = {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}}
-STATUS_ERR = {"status": "err", "response": "User or API Wallet 0x... does not exist"}
-PER_ORDER_ERR = {"status": "ok", "response": {"data": {"statuses": [{"filled": {}}, {"error": "Insufficient margin"}]}}}
-PER_ORDER_ERR_STR = {"status": "ok", "response": {"data": {"statuses": ["error: margin"]}}}
+OK_FILLED = {"orderId": 1, "status": "FILLED", "executedQty": "0.01"}
+OK_NEW = {"orderId": 2, "status": "NEW"}
+ERR_CODE = {"code": -2010, "msg": "Insufficient margin"}
+STATUS_REJECTED = {"orderId": 3, "status": "REJECTED"}
+STATUS_EXPIRED = {"orderId": 4, "status": "EXPIRED"}
 
 
 def test_validate_order_result():
     assert validate_order_result(OK_FILLED, "ctx") is OK_FILLED
-    assert validate_order_result(OK_RESTING, "ctx") is OK_RESTING
+    assert validate_order_result(OK_NEW, "ctx") is OK_NEW
 
     for bad, label in [
-        (STATUS_ERR, "status err"),
-        (PER_ORDER_ERR, "per-order dict error"),
-        (PER_ORDER_ERR_STR, "per-order str error"),
+        (ERR_CODE, "error code negatif Binance"),
+        (STATUS_REJECTED, "status REJECTED"),
+        (STATUS_EXPIRED, "status EXPIRED"),
         ("bukan-dict", "respons bukan dict"),
         (None, "respons None"),
     ]:

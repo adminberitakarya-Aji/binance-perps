@@ -1,102 +1,205 @@
 """
-Fetch candle historis dari Hyperliquid dan simpan ke CSV untuk backtest.
+Fetch candle historis dari Binance USDⓈ-M Futures (fapi / Binance Vision S3 archive)
+dan simpan ke CSV untuk backtest.
+Endpoint publik, tidak memerlukan API key / signing:
 
-Jalankan ini di mesin kamu sendiri (bukan di sandbox), karena butuh akses
-langsung ke API Hyperliquid:
-
-    python -m src.backtest.fetch_historical --symbol BTC --interval 1h --days 180
+    python -m src.backtest.fetch_historical --symbol BTCUSDT --interval 1h --days 365
 
 Hasilnya disimpan di data/<symbol>_<interval>.csv
 """
 
 import argparse
+import calendar
 import csv
+import io
 import os
 import time
+import zipfile
 
-from src.config import Config
-from src.client import HyperliquidClient
+import requests
+
+FAPI_URL = "https://fapi.binance.com/fapi/v1/klines"
+SPOT_URL = "https://api.binance.com/api/v3/klines"
+TIMEOUT = 5
+SLEEP = 0.1
+
+_UNIT_MIN = {"m": 1, "h": 60, "d": 1440}
 
 
-def fetch_and_save(symbol: str, interval: str, days: int, use_testnet: bool = False):
-    config = Config(
-        private_key=os.environ.get("HL_PRIVATE_KEY", ""),
-        account_address=os.environ.get("HL_ACCOUNT_ADDRESS", ""),
-        use_testnet=use_testnet,
-    )
-    # Info endpoint (candle historis) tidak butuh signing, jadi private_key
-    # boleh kosong untuk keperluan fetch data saja -- tapi HyperliquidClient
-    # butuh private_key valid untuk inisialisasi wallet. Kalau cuma mau
-    # fetch data tanpa trading, generate dummy key sekali pakai:
-    if not config.private_key:
-        import eth_account
-        config.private_key = eth_account.Account.create().key.hex()
+def _interval_minutes(interval: str) -> int:
+    return int(interval[:-1]) * _UNIT_MIN[interval[-1]]
 
-    client = HyperliquidClient(config)
 
-    now_ms = int(time.time() * 1000)
-    interval_ms = _interval_to_ms(interval)
-    start_ms = now_ms - interval_ms * _bars_needed(interval, days)
+def fetch_from_vision_s3(symbol: str, interval: str, start_ms: int, end_ms: int) -> list:
+    """Fetch arsip resmi Binance Vision (data.binance.vision).
+    Dapat diakses bebas bahkan saat API domain terblokir ISP.
+    """
+    interval_ms = _interval_minutes(interval) * 60_000
+    out = {}
 
-    print(f"Fetching {symbol} {interval} candles, {days} hari terakhir...")
+    def _parse_zip(content):
+        zf = zipfile.ZipFile(io.BytesIO(content))
+        rows = zf.read(zf.namelist()[0]).decode().strip().split("\n")
+        for line in rows:
+            parts = line.split(",")
+            if not parts[0].strip().isdigit():
+                continue
+            ts = int(parts[0])
+            t = ts // 1000 if ts > 10**14 else ts
+            if t < start_ms or t > end_ms:
+                continue
+            out[t] = {
+                "t": t,
+                "T": t + interval_ms - 1,
+                "o": parts[1],
+                "h": parts[2],
+                "l": parts[3],
+                "c": parts[4],
+                "v": parts[5],
+                "n": parts[8] if len(parts) > 8 else "",
+            }
 
-    all_candles = []
-    seen_t = set()
+    # 1) zip bulanan
+    m_start = time.gmtime(start_ms / 1000)
+    y, m = m_start.tm_year, m_start.tm_mon
+    now = time.gmtime()
+    while (y, m) <= (now.tm_year, now.tm_mon):
+        # Coba futures um dulu, lalu spot
+        urls = [
+            f"https://data.binance.vision/data/futures/um/monthly/klines/{symbol}/{interval}/{symbol}-{interval}-{y:04d}-{m:02d}.zip",
+            f"https://data.binance.vision/data/spot/monthly/klines/{symbol}/{interval}/{symbol}-{interval}-{y:04d}-{m:02d}.zip",
+        ]
+        for url in urls:
+            try:
+                r = requests.get(url, timeout=15)
+                if r.status_code == 200:
+                    _parse_zip(r.content)
+                    break
+            except Exception:
+                pass
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
+        time.sleep(SLEEP)
+
+    # 2) sisa hari di bulan berjalan
+    day_ms = 86_400_000
+    month_start_ms = calendar.timegm(
+        time.strptime(time.strftime("%Y-%m-01", time.gmtime(end_ms / 1000)), "%Y-%m-%d")
+    ) * 1000
+    day = month_start_ms
+    while day <= end_ms:
+        gt = time.gmtime(day / 1000)
+        urls = [
+            f"https://data.binance.vision/data/futures/um/daily/klines/{symbol}/{interval}/{symbol}-{interval}-{gt.tm_year:04d}-{gt.tm_mon:02d}-{gt.tm_mday:02d}.zip",
+            f"https://data.binance.vision/data/spot/daily/klines/{symbol}/{interval}/{symbol}-{interval}-{gt.tm_year:04d}-{gt.tm_mon:02d}-{gt.tm_mday:02d}.zip",
+        ]
+        for url in urls:
+            try:
+                r = requests.get(url, timeout=10)
+                if r.status_code == 200:
+                    _parse_zip(r.content)
+                    break
+            except Exception:
+                pass
+        day += day_ms
+        time.sleep(SLEEP)
+
+    return [out[t] for t in sorted(out)]
+
+
+def fetch_from_api(symbol: str, interval: str, start_ms: int, end_ms: int) -> list:
+    """Fetch langsung via REST klines endpoint."""
+    interval_ms = _interval_minutes(interval) * 60_000
+    out = {}
     cursor = start_ms
-    # Hyperliquid membatasi jumlah candle per request (~5000) DAN retensi
-    # historisnya pendek: candleSnapshot cuma menyimpan ~5000 bar terakhir
-    # (di 15m itu ~52 hari). Window yang seluruhnya di luar retensi
-    # dikembalikan kosong. Strategi: minta [cursor, now], maju ke candle
-    # terakhir yang diterima; kalau kosong, geser window ke depan per
-    # 5000 bar sampai data mulai tersedia -- jadi selalu dapat maksimum
-    # retensi alih-alih gagal diam-diam dengan 0 candle.
-    while cursor < now_ms:
-        chunk = client.get_candles(symbol, interval, cursor, now_ms)
-        if not chunk:
-            cursor += interval_ms * 5000
-            continue
-        for c in chunk:
-            t = int(c["t"])
-            if t not in seen_t:
-                seen_t.add(t)
-                all_candles.append(c)
-        last_t = int(chunk[-1]["t"])
+
+    while cursor < end_ms:
+        r = None
+        for base_url in [FAPI_URL, SPOT_URL]:
+            try:
+                r = requests.get(base_url, params={
+                    "symbol": symbol,
+                    "interval": interval,
+                    "startTime": cursor,
+                    "endTime": end_ms,
+                    "limit": 1500,
+                }, timeout=TIMEOUT)
+                if r.status_code == 200:
+                    break
+            except Exception:
+                continue
+
+        if r is None or r.status_code != 200:
+            break
+
+        rows = r.json()
+        if not rows or not isinstance(rows, list):
+            break
+
+        for row in rows:
+            t = int(row[0])
+            out[t] = {
+                "t": t,
+                "T": int(row[6]),
+                "o": row[1],
+                "h": row[2],
+                "l": row[3],
+                "c": row[4],
+                "v": row[5],
+                "n": row[8] if len(row) > 8 else 0,
+            }
+
+        last_t = int(rows[-1][0])
         next_cursor = last_t + interval_ms
         if next_cursor <= cursor:
-            break  # pengaman anti infinite-loop
+            break
         cursor = next_cursor
-        time.sleep(0.2)  # sopan ke rate limit
+        time.sleep(SLEEP)
 
+    return [out[t] for t in sorted(out)]
+
+
+def fetch_and_save(symbol: str = "BTCUSDT", interval: str = "1h", days: int = 365, out: str | None = None):
+    now_ms = int(time.time() * 1000)
+    interval_ms = _interval_minutes(interval) * 60_000
+    start_ms = now_ms - interval_ms * ((days * 86_400_000) // interval_ms)
+
+    print(f"Mengunduh {symbol} {interval} klines Binance ({days} hari terakhir)...")
+
+    # 1. Coba Binance Vision S3 (arsip penuh, sangat stabil & anti-blokir)
+    print("Mencoba Binance Vision S3...")
+    candles = fetch_from_vision_s3(symbol, interval, start_ms, now_ms)
+    source = "Binance Vision S3"
+
+    # 2. Fallback ke Direct REST API jika S3 kosong
+    if not candles:
+        print("Mencoba REST API Binance...")
+        candles = fetch_from_api(symbol, interval, start_ms, now_ms)
+        source = "Binance REST API"
+
+    if not candles:
+        print("Peringatan: Gagal mendapatkan candle dari semua sumber.")
+        return
 
     os.makedirs("data", exist_ok=True)
-    out_path = f"data/{symbol}_{interval}.csv"
+    out_path = out or f"data/{symbol}_{interval}.csv"
     with open(out_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["t", "T", "o", "h", "l", "c", "v", "n"])
         writer.writeheader()
-        for c in all_candles:
-            writer.writerow({k: c.get(k, "") for k in ["t", "T", "o", "h", "l", "c", "v", "n"]})
+        writer.writerows(candles)
 
-    print(f"Selesai: {len(all_candles)} candle disimpan ke {out_path}")
-
-
-def _interval_to_ms(interval: str) -> int:
-    unit = interval[-1]
-    value = int(interval[:-1])
-    multipliers = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}
-    return value * multipliers[unit]
-
-
-def _bars_needed(interval: str, days: int) -> int:
-    interval_ms = _interval_to_ms(interval)
-    return (days * 86_400_000) // interval_ms
+    first = time.strftime("%Y-%m-%d %H:%M", time.gmtime(candles[0]["t"] / 1000))
+    last = time.strftime("%Y-%m-%d %H:%M", time.gmtime(candles[-1]["t"] / 1000))
+    print(f"Selesai (sumber: {source}): {len(candles)} candle ({first} s/d {last} UTC) disimpan ke {out_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--symbol", default="BTC")
+    parser = argparse.ArgumentParser(description="Fetch candle historis Binance Futures")
+    parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--interval", default="1h")
-    parser.add_argument("--days", type=int, default=180)
-    parser.add_argument("--testnet", action="store_true", help="fetch dari testnet (default: mainnet, karena histori harga testnet lebih pendek/kurang representatif)")
+    parser.add_argument("--days", type=int, default=365)
+    parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
-    fetch_and_save(args.symbol, args.interval, args.days, use_testnet=args.testnet)
+    fetch_and_save(args.symbol, args.interval, args.days, args.out)

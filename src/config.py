@@ -1,37 +1,34 @@
 """
-Konfigurasi agent. Baca dari environment variables (lihat .env.example).
-JANGAN commit private key ke git.
+Konfigurasi agent Binance USDⓈ-M Futures. Baca dari environment variables (lihat .env.example).
+JANGAN commit API Key & Secret ke git.
 """
 
 import os
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
-from hyperliquid.utils import constants
+
+BINANCE_MAINNET_URL = "https://fapi.binance.com"
+BINANCE_TESTNET_URL = "https://testnet.binancefuture.com"
 
 
 @dataclass
 class Config:
-    # Private key dari API wallet (BUKAN wallet utama). Buat API wallet
-    # terpisah lewat app.hyperliquid.xyz/API -> approve agent wallet.
-    private_key: str
-    # Alamat wallet utama (yang menyimpan dana), dipakai untuk query state.
-    account_address: str
+    api_key: str
+    api_secret: str
     use_testnet: bool = True
+    symbol: str = "BTCUSDT"
     # Alert Telegram (opsional -- kosongkan keduanya = silent mode)
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
-    # Filter ML Fase 2. DEFAULT FALSE: validasi venue di data HL asli
-    # (Feb-Agu 2026, docs/go_live_validation.md) TIDAK mengkonfirmasi edge
-    # WF (+0.075R) -- filter malah memilih trade yang lebih buruk di periode
-    # itu. Aktifkan hanya SETELAH model di-retrain & validasi ulang lolos.
+    # Filter ML Fase 2. DEFAULT FALSE
     ml_filter_enabled: bool = False
     ml_threshold: float = 0.60
-    ml_model_path: str = ""  # kosong = default models/btc_ml_rf_1h.onnx
+    ml_model_path: str = ""  # kosong = default models/btcusdt_ml_rf_1h.onnx
 
     @property
     def api_url(self) -> str:
-        return constants.TESTNET_API_URL if self.use_testnet else constants.MAINNET_API_URL
+        return BINANCE_TESTNET_URL if self.use_testnet else BINANCE_MAINNET_URL
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -39,23 +36,25 @@ class Config:
         # Variabel yang sudah di-set di shell tetap menang (tidak di-override).
         load_dotenv()
 
-        private_key = os.environ.get("HL_PRIVATE_KEY")
-        account_address = os.environ.get("HL_ACCOUNT_ADDRESS")
-        use_testnet = os.environ.get("HL_USE_TESTNET", "true").lower() == "true"
+        api_key = os.environ.get("BINANCE_API_KEY", "").strip()
+        api_secret = os.environ.get("BINANCE_API_SECRET", "").strip()
+        use_testnet = os.environ.get("BINANCE_USE_TESTNET", "true").lower() == "true"
+        symbol = os.environ.get("BINANCE_SYMBOL", "BTCUSDT").strip().upper()
         ml_enabled = os.environ.get("ML_FILTER_ENABLED", "false").lower() == "true"
         ml_threshold = float(os.environ.get("ML_THRESHOLD", "0.60"))
         ml_model_path = (os.environ.get("ML_MODEL_PATH") or "").strip()
 
-        if not private_key or not account_address:
+        if not api_key or not api_secret:
             raise ValueError(
-                "HL_PRIVATE_KEY dan HL_ACCOUNT_ADDRESS wajib di-set. "
+                "BINANCE_API_KEY dan BINANCE_API_SECRET wajib di-set. "
                 "Copy .env.example ke .env dan isi nilainya."
             )
 
         return cls(
-            private_key=private_key,
-            account_address=account_address,
+            api_key=api_key,
+            api_secret=api_secret,
             use_testnet=use_testnet,
+            symbol=symbol,
             telegram_bot_token=(os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip(),
             telegram_chat_id=(os.environ.get("TELEGRAM_CHAT_ID") or "").strip(),
             ml_filter_enabled=ml_enabled,
