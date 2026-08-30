@@ -310,10 +310,11 @@ def _build_indicators(s: DashboardState) -> Panel:
                  border_style="cyan", padding=(0, 1))
 
 
+
 # ── Panel 3: ML ONNX ──────────────────────────────────────────────────── #
 def _build_ml(s: DashboardState) -> Panel:
     tbl = Table(show_header=False, box=None, expand=True, padding=(0, 1))
-    tbl.add_column(style=C_DIM, width=20)
+    tbl.add_column(style=C_DIM, width=22)
     tbl.add_column(ratio=1)
 
     enabled_str = (
@@ -323,27 +324,90 @@ def _build_ml(s: DashboardState) -> Panel:
     )
     tbl.add_row("Status", Text.from_markup(enabled_str))
     tbl.add_row("Model",  Text(s.ml_model_name, style="italic dim"))
-    tbl.add_row("Threshold", Text(f"{s.ml_threshold:.2f}", style=C_WHITE))
-    tbl.add_row("─" * 20, "─" * 25)
+    tbl.add_row("─" * 22, "─" * 25)
 
-    # probabilitas terakhir
+    # ── Threshold row: tampilkan sebagai % dan label ──────────────────
+    thresh_pct = s.ml_threshold * 100
+    tbl.add_row(
+        "Min. Threshold",
+        Text.from_markup(
+            f"[{C_WHITE}]{s.ml_threshold:.2f}[/{C_WHITE}]"
+            f"  [{C_DIM}]({thresh_pct:.0f}% win prob)[/{C_DIM}]"
+        ),
+    )
+
+    # ── p(win) + progress bar dengan penanda threshold ────────────────
     if s.ml_last_prob is not None:
-        bar_width = 20
-        filled    = int(s.ml_last_prob * bar_width)
-        bar_col   = C_GREEN if s.ml_last_prob >= s.ml_threshold else C_RED
-        bar       = f"[{bar_col}]{'█' * filled}[/{bar_col}][dim]{'░' * (bar_width - filled)}[/dim]"
-        prob_str  = f"{s.ml_last_prob:.3f}  {bar}"
+        bar_width   = 24
+        filled      = int(s.ml_last_prob * bar_width)
+        thresh_pos  = int(s.ml_threshold * bar_width)  # posisi penanda |
+        pass_fail   = s.ml_last_prob >= s.ml_threshold
+        bar_col     = C_GREEN if pass_fail else C_RED
+        prob_pct    = s.ml_last_prob * 100
+
+        # bangun bar karakter per karakter dengan penanda threshold "|"
+        bar_chars = []
+        for i in range(bar_width):
+            if i == thresh_pos:
+                bar_chars.append("|")          # penanda threshold
+            elif i < filled:
+                bar_chars.append("█")
+            else:
+                bar_chars.append("░")
+        bar_str = "".join(bar_chars)
+
+        # warnai: sebelum penanda = bar_col, penanda = gold, setelah = dim
+        bar_markup = (
+            f"[{bar_col}]{bar_str[:thresh_pos]}[/{bar_col}]"
+            f"[{C_GOLD}]|[/{C_GOLD}]"
+            f"[dim]{bar_str[thresh_pos+1:]}[/dim]"
+        )
+        compare_str = (
+            f"[{C_GREEN}]≥[/{C_GREEN}]" if pass_fail
+            else f"[{C_RED}]<[/{C_RED}]"
+        )
+        prob_str = (
+            f"[{bar_col}]{prob_pct:.1f}%[/{bar_col}]"
+            f"  {compare_str}  "
+            f"[{C_DIM}]{thresh_pct:.0f}%[/{C_DIM}]"
+            f"  {bar_markup}"
+        )
     else:
-        prob_str = "[dim]—[/dim]"
+        prob_str = "[dim]Menunggu sinyal berikutnya...[/dim]"
 
-    tbl.add_row("Last p(win)", Text.from_markup(prob_str))
+    tbl.add_row("p(win)", Text.from_markup(prob_str))
 
+    # ── Hasil keputusan filter ────────────────────────────────────────
     result_col = _ml_result_style(s.ml_last_result)
-    tbl.add_row("Signal Filter",
-                Text.from_markup(f"[{result_col}]◆ {s.ml_last_result}[/{result_col}]"))
+    result_desc = {
+        "PASS": "sinyal LOLOS → entry diizinkan",
+        "SKIP": "sinyal DITOLAK → entry diblok",
+        "HOLD": "tidak ada sinyal di candle ini",
+        "—":    "belum ada evaluasi",
+    }.get(s.ml_last_result, "")
+    tbl.add_row(
+        "Signal Filter",
+        Text.from_markup(
+            f"[{result_col}]◆ {s.ml_last_result}[/{result_col}]"
+            + (f"  [{C_DIM}]{result_desc}[/{C_DIM}]" if result_desc else "")
+        ),
+    )
+
+    # ── Info sizing ────────────────────────────────────────────────────
+    tbl.add_row("─" * 22, "─" * 25)
+    tbl.add_row(
+        "Risk per Trade",
+        Text.from_markup(f"[{C_WHITE}]1% equity[/{C_WHITE}]  [{C_DIM}](SL = 2× ATR)[/{C_DIM}]"),
+    )
+    tbl.add_row(
+        "Max Leverage",
+        Text.from_markup(f"[{C_WHITE}]3×[/{C_WHITE}]  [{C_DIM}](cap notional)[/{C_DIM}]"),
+    )
 
     return Panel(tbl, title="[bold]🤖 Machine Learning (ONNX)[/bold]",
                  border_style="bright_magenta", padding=(0, 1))
+
+
 
 
 # ── Panel 4: Posisi & Risk ────────────────────────────────────────────── #
