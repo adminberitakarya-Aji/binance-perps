@@ -694,7 +694,8 @@ class DashboardRunner:
         return _build_layout(self.state.snapshot(), self.capture)
 
     def run_live(self, poll_fn, kill_switch_fn, poll_interval_s: int,
-                 kill_switch_interval_s: int = 60):
+                 kill_switch_interval_s: int = 60,
+                 candle_buffer_s: int = 300):
         """
         Gantikan loop utama main.py: jalankan polling engine sambil
         merender dashboard Rich secara live.
@@ -704,36 +705,54 @@ class DashboardRunner:
             kill_switch_fn: callable untuk monitor kill switch
             poll_interval_s: interval poll (detik, selaras boundary candle)
             kill_switch_interval_s: interval cek kill switch
+            candle_buffer_s: detik buffer setelah candle close (default 300 = 5 menit)
         """
-        from main import seconds_until_next_poll  # hindari circular import
+        def _next_poll_ts() -> float:
+            """Hitung timestamp poll berikutnya (boundary candle + buffer)."""
+            now = time.time()
+            cur = int(now // poll_interval_s) * poll_interval_s + candle_buffer_s
+            target = cur if now < cur else cur + poll_interval_s
+            return max(target, now + 1.0)
 
-        with Live(
-            _build_layout(self.state.snapshot(), self.capture),
-            console=self._console,
-            refresh_per_second=1.0 / REFRESH_INTERVAL,
-            screen=True,
-        ) as live:
-            self._live = live
-            while True:
-                # Update next poll countdown
-                next_poll_ts = time.time() + seconds_until_next_poll(poll_interval_s)
-                self.state.update(next_poll_ts=next_poll_ts)
-
-                # Jalankan engine
-                try:
-                    poll_fn()
-                except Exception as e:
-                    self.state.update(last_error=str(e))
-
-                # Refresh sampai poll berikutnya
-                deadline = next_poll_ts
+        console = Console(force_terminal=True, highlight=False)
+        try:
+            with Live(
+                _build_layout(self.state.snapshot(), self.capture),
+                console=console,
+                refresh_per_second=1.0 / REFRESH_INTERVAL,
+                screen=True,
+            ) as live:
+                self._live = live
                 while True:
-                    live.update(_build_layout(self.state.snapshot(), self.capture))
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        break
-                    time.sleep(min(kill_switch_interval_s, remaining, REFRESH_INTERVAL))
+                    # Update countdown ke poll berikutnya
+                    next_ts = _next_poll_ts()
+                    self.state.update(next_poll_ts=next_ts)
+
+                    # Jalankan engine (run_once)
                     try:
-                        kill_switch_fn()
-                    except Exception:
-                        pass
+                        poll_fn()
+                    except KeyboardInterrupt:
+                        raise  # propagate ke handler luar
+                    except Exception as e:
+                        self.state.update(last_error=str(e))
+
+                    # Refresh UI sampai poll berikutnya
+                    deadline = next_ts
+                    while True:
+                        live.update(_build_layout(self.state.snapshot(), self.capture))
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            break
+                        sleep_s = min(kill_switch_interval_s, remaining, REFRESH_INTERVAL)
+                        time.sleep(sleep_s)
+                        try:
+                            kill_switch_fn()
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception:
+                            pass
+
+        except KeyboardInterrupt:
+            # Ctrl+C: tutup dashboard dengan bersih (tanpa traceback)
+            self.stop()
+            console.print("\n[bold yellow]Dashboard dihentikan (Ctrl+C). Bot berhenti.[/bold yellow]")
