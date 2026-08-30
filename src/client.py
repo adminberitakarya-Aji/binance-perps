@@ -252,21 +252,31 @@ class BinanceFuturesClient:
 
     # ------------------------------------------------------------------
     # Orders & Execution
-    # ------------------------------------------------------------------
+    def place_market_order_raw(self, symbol: str, is_buy: bool, size: float) -> dict:
+        """Kirim market order murni tanpa proteksi SL/TP otomatis (dipakai DCA layer)."""
+        side = "BUY" if is_buy else "SELL"
+        qty = self.round_size(symbol, size)
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": qty,
+        }
+        return validate_order_result(
+            self._request("POST", "/fapi/v1/order", params, signed=True),
+            f"market order raw {symbol}",
+        )
+
     def place_market_order(
         self,
         symbol: str,
         is_buy: bool,
         size: float,
-        reduce_only: bool = False,
         sl: float | None = None,
         tp: float | None = None,
-    ):
-        """Order market entry atau close.
-        Jika sl/tp diberikan: pasang STOP_MARKET dan TAKE_PROFIT_MARKET setelah entry terisi.
-        Jika proteksi gagal: posisi ditutup paksa (ProtectionError).
-        """
-        if reduce_only:
+    ) -> dict:
+        """Market order untuk entry baru + pasang proteksi SL/TP reduce-only."""
+        if abs(size) < 1e-9:
             return self.market_close_position(symbol)
 
         side = "BUY" if is_buy else "SELL"

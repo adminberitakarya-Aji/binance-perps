@@ -41,7 +41,24 @@ def build_engine(config: Config) -> tuple[TradingEngine, TelegramNotifier, objec
 
     # Konfigurasi strategi produksi
     strategy     = TrendReversalStrategy(require_trend_alignment=False)
-    risk_manager = RiskManager(RiskLimits())
+    limits       = RiskLimits(
+        max_leverage=config.max_leverage,
+        max_daily_loss_pct=config.max_daily_loss_pct,
+        atr_sl_mult=config.atr_sl_mult,
+        tp_rr_ratio=config.tp_rr_ratio,
+        risk_per_trade_pct=config.risk_per_trade_pct,
+        use_trailing=config.trailing_enabled,
+        trailing_start_atr_mult=config.trailing_start_atr_mult,
+        trailing_distance_atr_mult=config.trailing_distance_atr_mult,
+        trailing_step_atr_mult=config.trailing_step_atr_mult,
+        dca_enabled=config.dca_enabled,
+        dca_max_orders=config.dca_max_orders,
+        dca_step_atr_mult=config.dca_step_atr_mult,
+        dca_lot_multiplier=config.dca_lot_multiplier,
+        dca_tp_rr_ratio=config.dca_tp_rr_ratio,
+        dca_hard_sl_equity_pct=config.dca_hard_sl_equity_pct,
+    )
+    risk_manager = RiskManager(limits)
     executor     = OrderExecutor(client, notifier)
 
     # Filter ML (opsional, default nonaktif sampai model Binance tervalidasi)

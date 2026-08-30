@@ -117,14 +117,18 @@ class DashboardState:
         self.ml_last_result: str          = "—"   # PASS / SKIP / HOLD
         self.ml_model_name : str          = "btcusdt_ml_rf_1h.onnx"
 
-        # Posisi
+        # Posisi & DCA
         self.pos_symbol    : str | None   = None
         self.pos_side      : str | None   = None   # BUY / SELL
         self.pos_size      : float | None = None
         self.pos_entry     : float | None = None
+        self.pos_avg_entry : float | None = None
         self.pos_sl        : float | None = None
         self.pos_tp        : float | None = None
         self.pos_float_pnl : float | None = None
+        self.dca_enabled   : bool         = False
+        self.dca_max_orders: int          = 3
+        self.dca_current_layer: int       = 0
 
         # Risk / Akun
         self.balance       : float | None = None
@@ -416,6 +420,13 @@ def _build_position(s: DashboardState) -> Panel:
     tbl.add_column(style=C_DIM, width=20)
     tbl.add_column(ratio=1)
 
+    # ── DCA Status Header ──────────────────────────────────────────────
+    if s.dca_enabled:
+        dca_str = f"[{C_GREEN}]✔ ACTIVE[/{C_GREEN}]  [{C_DIM}](Max: {s.dca_max_orders} Lapis)[/{C_DIM}]"
+    else:
+        dca_str = f"[{C_DIM}]○ OFF (Single Entry)[/{C_DIM}]"
+    tbl.add_row("DCA Mode", Text.from_markup(dca_str))
+
     if s.pos_symbol:
         side_col = C_GREEN if s.pos_side == "BUY" else C_RED
         side_arrow = "▲" if s.pos_side == "BUY" else "▼"
@@ -423,14 +434,24 @@ def _build_position(s: DashboardState) -> Panel:
                     Text.from_markup(f"[{C_GOLD}]{s.pos_symbol}[/{C_GOLD}]"))
         tbl.add_row("Side",
                     Text.from_markup(f"[{side_col}]{side_arrow} {s.pos_side}[/{side_col}]"))
-        tbl.add_row("Size",
+        tbl.add_row("Total Size",
                     Text.from_markup(f"[white]{s.pos_size:.4f}[/white]" if s.pos_size else "—"))
-        tbl.add_row("Entry Price",  Text.from_markup(_fmt_price(s.pos_entry)))
-        tbl.add_row("Stop Loss",
-                    Text.from_markup(f"[{C_RED}]{_fmt_price(s.pos_sl)}[/{C_RED}]"))
+
+        # Jika ada multi-lapis DCA: tampilkan avg entry & layer
+        if s.dca_enabled and s.dca_current_layer > 1 and s.pos_avg_entry:
+            tbl.add_row("DCA Active",
+                        Text.from_markup(f"[{C_GOLD}]Lapis {s.dca_current_layer}/{s.dca_max_orders}[/{C_GOLD}]"))
+            tbl.add_row("Avg Entry Price",
+                        Text.from_markup(f"[{C_GOLD}]{_fmt_price(s.pos_avg_entry)}[/{C_GOLD}]"))
+        else:
+            tbl.add_row("Entry Price", Text.from_markup(_fmt_price(s.pos_entry)))
+
         tbl.add_row("Take Profit",
                     Text.from_markup(f"[{C_GREEN}]{_fmt_price(s.pos_tp)}[/{C_GREEN}]"))
+        tbl.add_row("Stop Loss",
+                    Text.from_markup(f"[{C_RED}]{_fmt_price(s.pos_sl)}[/{C_RED}]"))
         tbl.add_row("─" * 20, "─" * 25)
+
         # Floating PnL
         fpnl = s.pos_float_pnl
         fpnl_col = C_GREEN if (fpnl or 0) >= 0 else C_RED
@@ -540,6 +561,8 @@ class DashboardCollector(threading.Thread):
             "kill_triggered": bool(eng.daily_state.get("kill_triggered", False)),
             "daily_pnl_pct":  eng.risk_manager.daily_pnl_pct
                                if hasattr(eng.risk_manager, "daily_pnl_pct") else None,
+            "dca_enabled":    bool(eng.risk_manager.limits.dca_enabled),
+            "dca_max_orders": int(eng.risk_manager.limits.dca_max_orders),
             "last_run_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
 
@@ -587,26 +610,31 @@ class DashboardCollector(threading.Thread):
         except Exception:
             pass
 
-        # ── Posisi terbuka ───────────────────────────────────────────
+        # ── Posisi terbuka & DCA layers ───────────────────────────────
         try:
             pos = eng.client.get_position(cfg.symbol)
             if pos:
                 state_pos = eng.live_positions.get(cfg.symbol, {})
                 szi = float(pos.get("szi", 0))
+                layers = state_pos.get("layers", [])
                 updates.update({
-                    "pos_symbol":    cfg.symbol,
-                    "pos_side":      "BUY" if szi > 0 else "SELL",
-                    "pos_size":      abs(szi),
-                    "pos_entry":     float(pos.get("entryPx", 0)) or None,
-                    "pos_sl":        state_pos.get("sl"),
-                    "pos_tp":        state_pos.get("tp"),
-                    "pos_float_pnl": float(pos.get("unrealizedPnl", 0)) or None,
+                    "pos_symbol":         cfg.symbol,
+                    "pos_side":           "BUY" if szi > 0 else "SELL",
+                    "pos_size":           abs(szi),
+                    "pos_entry":          float(pos.get("entryPx", 0)) or None,
+                    "pos_avg_entry":      float(state_pos.get("avg_price") or pos.get("entryPx", 0)) or None,
+                    "pos_sl":             state_pos.get("sl"),
+                    "pos_tp":             state_pos.get("tp"),
+                    "pos_float_pnl":      float(pos.get("unrealizedPnl", 0)) or None,
+                    "dca_current_layer":  len(layers) if layers else 1,
                 })
             else:
                 updates.update({
                     "pos_symbol": None, "pos_side": None,
                     "pos_size": None, "pos_entry": None,
-                    "pos_sl": None, "pos_tp": None, "pos_float_pnl": None,
+                    "pos_avg_entry": None, "pos_sl": None,
+                    "pos_tp": None, "pos_float_pnl": None,
+                    "dca_current_layer": 0,
                 })
         except Exception:
             pass

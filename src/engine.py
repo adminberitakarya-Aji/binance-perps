@@ -23,7 +23,7 @@ class TradingEngine:
         symbols: list,
         interval: str = "1h",
         notifier: TelegramNotifier | None = None,
-        ml_filter=None,  # MLSignalFilter | None; None = tanpa filter ML
+        ml_filter=None,  # MLSignalFilter | None
     ):
         self.client = client
         self.strategy = strategy
@@ -32,17 +32,16 @@ class TradingEngine:
         self.symbols = symbols
         self.interval = interval
         self.ml_filter = ml_filter
-        # notifier default = no-op (mode silent) supaya test/wiring lama tidak pecah
         self.notifier = notifier or TelegramNotifier()
         self.state_path = os.path.join("data", "live_positions.json")
-        self.live_positions: dict = {}  # symbol -> {"side", "entry_price", "entry_atr", "sl", "tp"}
+        self.live_positions: dict = {}
         self.daily_state_path = os.path.join("data", "daily_state.json")
-        self.daily_state: dict = {}  # {"date_utc", "day_start_equity", "kill_triggered"}
+        self.daily_state: dict = {}
         self._load_state()
         self._load_daily_state()
 
     # ------------------------------------------------------------------
-    # Persistensi state posisi live (trailing tetap benar setelah restart)
+    # Persistensi state posisi live (trailing & DCA tetap aman setelah restart)
     # ------------------------------------------------------------------
     def _load_state(self):
         try:
@@ -90,7 +89,6 @@ class TradingEngine:
             account_value = float(
                 state.get("totalMarginBalance", 0)
                 or state.get("totalWalletBalance", 0)
-                or state.get("marginSummary", {}).get("accountValue", 0)  # fallback kompatibilitas
                 or 0
             )
             if account_value <= 0:
@@ -128,7 +126,7 @@ class TradingEngine:
                 for sym, st in self.live_positions.items():
                     pos = self.client.get_position(sym)
                     size = abs(pos["szi"]) if pos else None
-                    positions.append((sym, st.get("side"), size, st.get("entry_price"), st.get("sl"), st.get("tp")))
+                    positions.append((sym, st.get("side"), size, st.get("avg_price", st.get("entry_price")), st.get("sl"), st.get("tp")))
                 self.notifier.notify_heartbeat(
                     today,
                     equity,
@@ -172,20 +170,19 @@ class TradingEngine:
         self._update_daily_pnl()
 
         for symbol in self.symbols:
-            # --- A. Kelola posisi terbuka dulu (trailing + cleanup) ---
+            # --- A. Kelola posisi terbuka (Hard SL, DCA averaging, trailing stop) ---
             self._manage_open_positions(symbol)
+
+            pos = self.client.get_position(symbol)
+            if pos is not None:
+                log.info("[%s] skip entry baru: masih ada posisi terbuka (%s, szi=%s)", symbol, pos["side"], pos["szi"])
+                continue
 
             need = self.strategy.required_bars()
             lookback = max(need + 10, 560)
             snapshot = fetch_snapshot(self.client, symbol, interval=self.interval, lookback_candles=lookback)
 
-            pos = self.client.get_position(symbol)
-            if pos is not None:
-                log.info("[%s] skip entry: masih ada posisi terbuka (%s, szi=%s)", symbol, pos["side"], pos["szi"])
-                continue
-
             result = self.strategy.generate_signal(snapshot)
-
             log.info("[%s] sinyal=%s conf=%s alasan=%s", symbol, result.signal.value, result.confidence, result.reason)
 
             if result.signal == Signal.HOLD:
@@ -208,6 +205,7 @@ class TradingEngine:
             if equity_usd is None:
                 log.error("[%s] equity tidak tersedia -> skip entry (fail-closed)", symbol)
                 continue
+
             size_usd = self.risk_manager.check_and_size(
                 equity_usd, result.signal, result.confidence, sl_distance_pct=sl_distance_pct
             )
@@ -221,19 +219,25 @@ class TradingEngine:
                     symbol, result.signal, size_usd, snapshot.mid_price, sl=sl, tp=tp
                 )
                 if exec_result is not None:
+                    size_asset = self.client.round_size(symbol, size_usd / snapshot.mid_price)
                     self.live_positions[symbol] = {
                         "side": "B" if result.signal == Signal.BUY else "S",
                         "entry_price": snapshot.mid_price,
+                        "avg_price": snapshot.mid_price,
+                        "total_size": size_asset,
                         "entry_atr": atr,
                         "sl": sl,
                         "tp": tp,
+                        "layers": [
+                            {"price": snapshot.mid_price, "size": size_asset, "atr": atr}
+                        ],
                     }
                     self._save_state()
                     log.info(
-                        "posisi %s dicatat: side=%s SL=%s TP=%s",
+                        "posisi %s dicatat: side=%s SL=%s TP=%s (Lapis 1/ %d)",
                         symbol, self.live_positions[symbol]["side"], sl, tp,
+                        self.risk_manager.limits.dca_max_orders,
                     )
-                    size_asset = self.client.round_size(symbol, size_usd / snapshot.mid_price)
                     self.notifier.notify_entry(
                         symbol=symbol,
                         signal=result.signal.value,
@@ -248,13 +252,13 @@ class TradingEngine:
                     )
 
     # ------------------------------------------------------------------
-    # Manajemen posisi terbuka: trailing SL + cleanup orphan trigger
+    # Manajemen posisi terbuka: Hard SL, Smart DCA, trailing SL
     # ------------------------------------------------------------------
     def _manage_open_positions(self, symbol: str):
         state = self.live_positions.get(symbol)
         pos = self.client.get_position(symbol)
 
-        # posisi sudah tertutup -> bersihkan
+        # 1. Posisi sudah tertutup -> bersihkan
         if pos is None:
             if state is not None:
                 log.info("[%s] posisi sudah tertutup -> hapus state & cancel trigger sisa", symbol)
@@ -273,25 +277,103 @@ class TradingEngine:
                 log.warning("[%s] cleanup trigger gagal: %s", symbol, e)
             return
 
-        # posisi ada tapi state hilang: rekonstruksi state minimal
+        # 2. Posisi ada tapi state hilang: rekonstruksi state minimal
         if state is None:
-            log.warning("[%s] posisi terbuka tanpa state -> rekonstruksi state minimal (trailing nonaktif)", symbol)
+            log.warning("[%s] posisi terbuka tanpa state -> rekonstruksi state minimal", symbol)
             self.live_positions[symbol] = {
                 "side": pos["side"],
                 "entry_price": pos["entryPx"],
+                "avg_price": pos["entryPx"],
+                "total_size": abs(pos["szi"]),
                 "entry_atr": None,
                 "sl": None,
                 "tp": None,
+                "layers": [{"price": pos["entryPx"], "size": abs(pos["szi"])}],
             }
             self._save_state()
-            self.notifier.notify_error(
-                f"Posisi {symbol} terbuka TANPA state -> state direkonstruksi, trailing NONAKTIF "
-                f"(side={pos['side']}, szi={pos['szi']})",
-                Exception("position state missing"),
-            )
             return
 
-        # --- SL guard (self-healing): posisi TIDAK boleh telanjang ---
+        equity = self._get_equity_or_none()
+        mid_px = self.client.get_mid_price(symbol)
+
+        # 3. --- HARD SL CUT-LOSS DARURAT ---
+        # Jika total kerugian keranjang >= batas darurat (misal 3% modal) -> TUTUP PAKSA
+        unrealized_pnl = float(pos.get("unrealizedPnl") or 0)
+        if equity and unrealized_pnl < 0:
+            floating_loss_usd = abs(unrealized_pnl)
+            if self.risk_manager.is_hard_sl_triggered(floating_loss_usd, equity):
+                log.critical(
+                    "[%s] HARD SL DARURAT TERPICU: loss -$%.2f >= %.1f%% modal -> TUTUP PAKSA SEMUA LAPIS",
+                    symbol, floating_loss_usd, self.risk_manager.limits.dca_hard_sl_equity_pct * 100
+                )
+                try:
+                    self.client.cancel_all_trigger_orders(symbol)
+                    self.client.market_close_position(symbol)
+                except Exception as e:
+                    log.critical("[%s] gagal market close hard SL: %s", symbol, e)
+                self.notifier.notify_force_close(
+                    symbol,
+                    f"Hard SL Cut-Loss -${floating_loss_usd:.2f}",
+                    detail="Floating loss melampaui batas darurat modal",
+                )
+                self.live_positions.pop(symbol, None)
+                self._save_state()
+                return
+
+        # 4. --- SMART DCA / AVERAGING DOWN ---
+        if self.risk_manager.limits.dca_enabled and state.get("entry_atr"):
+            layers = state.get("layers", [])
+            if not layers:
+                layers = [{"price": state["entry_price"], "size": abs(pos["szi"]), "atr": state["entry_atr"]}]
+                state["layers"] = layers
+                state["avg_price"] = state["entry_price"]
+                state["total_size"] = abs(pos["szi"])
+                self._save_state()
+
+            if len(layers) < self.risk_manager.limits.dca_max_orders:
+                last_layer_price = layers[-1]["price"]
+                signal = Signal.BUY if state["side"] == "B" else Signal.SELL
+                entry_atr = state["entry_atr"]
+
+                if self.risk_manager.should_trigger_dca(signal, last_layer_price, mid_px, entry_atr, len(layers)):
+                    base_size_usd = layers[0]["size"] * layers[0]["price"]
+                    layer_idx = len(layers)
+                    layer_size_usd = self.risk_manager.compute_dca_layer_size(equity or 5000.0, base_size_usd, layer_idx)
+                    layer_size_asset = self.client.round_size(symbol, layer_size_usd / mid_px)
+
+                    if layer_size_asset > 0:
+                        sim_layers = layers + [{"price": mid_px, "size": layer_size_asset, "atr": entry_atr}]
+                        new_avg_px, new_tot_sz, new_tp = self.risk_manager.compute_dca_avg_and_tp(signal, sim_layers, entry_atr)
+                        new_sl = state.get("sl")
+
+                        fill = self.executor.execute_dca_layer(
+                            symbol, signal, layer_size_usd, mid_px, new_tot_sz, new_sl, new_tp, layer_idx
+                        )
+                        if fill is not None:
+                            state["layers"] = sim_layers
+                            state["avg_price"] = new_avg_px
+                            state["total_size"] = new_tot_sz
+                            state["tp"] = new_tp
+                            self._save_state()
+                            log.info(
+                                "[%s] DCA Lapis %d BERHASIL: Size +%s (Total=%s), Avg Px=%s, New TP=%s",
+                                symbol, len(sim_layers), layer_size_asset, new_tot_sz, new_avg_px, new_tp
+                            )
+                            self.notifier.notify_entry(
+                                symbol=symbol,
+                                signal=f"DCA Lapis {len(sim_layers)}/{self.risk_manager.limits.dca_max_orders}",
+                                size=layer_size_asset,
+                                size_usd=layer_size_usd,
+                                price=mid_px,
+                                sl=new_sl,
+                                tp=new_tp,
+                                confidence=0.9,
+                                equity=equity or 0,
+                                reason=f"Averaging down: Avg Px -> ${new_avg_px:,.2f}",
+                            )
+                            return
+
+        # 5. --- SL guard (self-healing): posisi TIDAK boleh telanjang ---
         trigger_active = self.client.get_trigger_orders(symbol)
         sl_active = next((o for o in trigger_active if str(o.get("triggerCondition", "")).startswith("sl")), None)
         if state.get("sl") is not None and sl_active is None:
@@ -300,10 +382,6 @@ class TradingEngine:
                 close_is_buy = state["side"] == "S"
                 self.client.place_tpsl_pair(symbol, close_is_buy, abs(pos["szi"]), state["sl"], state.get("tp"))
                 log.info("[%s] SL dipasang ulang: SL=%s TP=%s", symbol, state["sl"], state.get("tp"))
-                self.notifier.notify_error(
-                    f"SL {symbol} hilang di exchange & sudah dipasang ulang (SL={state['sl']})",
-                    Exception("SL trigger missing"),
-                )
                 return
             except Exception as e:
                 log.critical("[%s] gagal pasang ulang SL (%s) -> TUTUP PAKSA posisi", symbol, e)
@@ -312,22 +390,16 @@ class TradingEngine:
                     self.client.market_close_position(symbol)
                 except Exception as e2:
                     log.critical("[%s] tutup paksa gagal (%s) -- PERIKSA MANUAL!", symbol, e2)
-                self.notifier.notify_force_close(
-                    symbol,
-                    f"{state.get('side', '?')} {abs(pos['szi'])} {symbol} (SL hilang, re-place gagal)",
-                    detail=str(e),
-                )
                 return
 
-        # --- trailing stop ---
+        # 6. --- TRAILING STOP BERBASIS AVERAGE ENTRY PRICE ---
         if self.risk_manager.limits.use_trailing and state.get("entry_atr") and state.get("sl") is not None:
             signal = Signal.BUY if state["side"] == "B" else Signal.SELL
-            entry_price = state["entry_price"]
+            avg_price = state.get("avg_price", state["entry_price"])
             entry_atr = state["entry_atr"]
 
-            best_px = self.client.get_mid_price(symbol)
             new_sl = self.risk_manager.compute_trailing_sl(
-                signal, entry_price, best_px, state["sl"], entry_atr
+                signal, avg_price, mid_px, state["sl"], entry_atr
             )
             if new_sl is None or abs(new_sl - state["sl"]) < 1e-9:
                 return
@@ -335,27 +407,18 @@ class TradingEngine:
             old_sl = state["sl"]
             close_is_buy = state["side"] == "S"
             try:
-                self.client.modify_sl_trigger(
-                    symbol, sl_active["oid"], close_is_buy, abs(pos["szi"]), new_sl
-                )
-                log.info("[%s] TRAILING: SL %s -> %s (mid=%s, modify)", symbol, old_sl, new_sl, best_px)
+                if sl_active is not None:
+                    self.client.modify_sl_trigger(
+                        symbol, sl_active["oid"], close_is_buy, abs(pos["szi"]), new_sl
+                    )
+                else:
+                    self.client.place_tpsl_pair(symbol, close_is_buy, abs(pos["szi"]), new_sl, state.get("tp"))
+                log.info("[%s] TRAILING: SL %s -> %s (mid=%s, avg_entry=%s)", symbol, old_sl, new_sl, mid_px, avg_price)
                 state["sl"] = new_sl
                 self._save_state()
-                self.notifier.notify_trailing(symbol, old_sl, new_sl, best_px)
+                self.notifier.notify_trailing(symbol, old_sl, new_sl, mid_px)
             except Exception as e:
-                log.error("[%s] gagal modify SL: %s -> fallback cancel+replace pair lama", symbol, e)
-                try:
-                    self.client.cancel_all_trigger_orders(symbol)
-                    self.client.place_tpsl_pair(symbol, close_is_buy, abs(pos["szi"]), state["sl"], state.get("tp"))
-                    log.info("[%s] pair lama dipulihkan (SL=%s)", symbol, state["sl"])
-                except Exception as e2:
-                    log.error("[%s] pulihkan gagal juga (%s) -> TUTUP PAKSA posisi", symbol, e2)
-                    try:
-                        self.client.cancel_all_trigger_orders(symbol)
-                        self.client.market_close_position(symbol)
-                    except Exception as e3:
-                        log.critical("[%s] tutup paksa gagal (%s) -- PERIKSA MANUAL!", symbol, e3)
-                    self.notifier.notify_force_close_trailing(symbol, state.get("sl"), best_px)
+                log.error("[%s] gagal modify SL: %s", symbol, e)
 
     def monitor_kill_switch(self):
         """Cek PnL harian/kill switch di luar siklus poll utama."""
