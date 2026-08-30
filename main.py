@@ -1,3 +1,4 @@
+import argparse
 import time
 
 from src.config import Config
@@ -27,9 +28,9 @@ def seconds_until_next_poll(
     return max(target - now, 1.0)
 
 
-def main():
-    config = Config.from_env()
-    client = BinanceFuturesClient(config)
+def build_engine(config: Config) -> tuple[TradingEngine, TelegramNotifier, object]:
+    """Bangun semua komponen engine dan kembalikan (engine, notifier, ml_filter)."""
+    client   = BinanceFuturesClient(config)
     notifier = TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id)
 
     # Inisialisasi cache filter exchange (tickSize, stepSize, minNotional)
@@ -39,18 +40,15 @@ def main():
         log.warning("Gagal load exchangeInfo awal: %s (akan retry saat eksekusi)", e)
 
     # Konfigurasi strategi produksi
-    strategy = TrendReversalStrategy(
-        require_trend_alignment=False,
-    )
+    strategy     = TrendReversalStrategy(require_trend_alignment=False)
     risk_manager = RiskManager(RiskLimits())
-    executor = OrderExecutor(client, notifier)
+    executor     = OrderExecutor(client, notifier)
 
     # Filter ML (opsional, default nonaktif sampai model Binance tervalidasi)
     ml_filter = None
     if config.ml_filter_enabled:
         try:
             from src.ml.inference import MLSignalFilter
-
             model_path = config.ml_model_path or None
             if model_path:
                 ml_filter = MLSignalFilter(model_path, threshold=config.ml_threshold)
@@ -66,13 +64,17 @@ def main():
         strategy=strategy,
         risk_manager=risk_manager,
         executor=executor,
-        symbols=[config.symbol],  # default BTCUSDT
+        symbols=[config.symbol],
         notifier=notifier,
         ml_filter=ml_filter,
     )
+    return engine, notifier, ml_filter
 
-    log.info("Agent Binance Futures mulai jalan (%s - %s)",
-             "TESTNET" if config.use_testnet else "MAINNET", config.symbol)
+
+def run_plain(engine: TradingEngine, notifier: TelegramNotifier):
+    """Loop utama tanpa dashboard (mode log biasa)."""
+    log.info("Agent Binance Futures mulai jalan (%s)",
+             "TESTNET" if engine.client.config.use_testnet else "MAINNET")
 
     while True:
         try:
@@ -91,6 +93,56 @@ def main():
                 engine.monitor_kill_switch()
             except Exception as e:
                 log.error("Error saat monitor kill switch: %s", e)
+
+
+def run_dashboard(engine: TradingEngine, notifier: TelegramNotifier, ml_filter):
+    """Loop utama dengan dashboard terminal visual (mode Rich)."""
+    from src.ui.dashboard import (
+        DashboardRunner,
+        install_log_capture,
+        patch_ml_filter,
+    )
+
+    log_capture = install_log_capture()
+    patch_ml_filter(ml_filter, None)  # state akan di-attach oleh runner
+
+    runner = DashboardRunner(engine, log_capture)
+
+    # Patch ML filter agar prob-nya masuk ke dashboard state
+    if ml_filter is not None:
+        patch_ml_filter(ml_filter, runner.state)
+
+    runner.start()
+    log.info("Dashboard Terminal Visual aktif — tekan Ctrl+C untuk keluar")
+
+    runner.run_live(
+        poll_fn=engine.run_once,
+        kill_switch_fn=engine.monitor_kill_switch,
+        poll_interval_s=POLL_INTERVAL_SECONDS,
+        kill_switch_interval_s=KILL_SWITCH_CHECK_SECONDS,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Binance Perps Trading Bot")
+    parser.add_argument(
+        "--dashboard", "--ui",
+        action="store_true",
+        default=False,
+        help="Tampilkan dashboard terminal visual real-time (default: mode log biasa)",
+    )
+    args = parser.parse_args()
+
+    config = Config.from_env()
+    engine, notifier, ml_filter = build_engine(config)
+
+    log.info("Agent Binance Futures mulai jalan (%s - %s)",
+             "TESTNET" if config.use_testnet else "MAINNET", config.symbol)
+
+    if args.dashboard:
+        run_dashboard(engine, notifier, ml_filter)
+    else:
+        run_plain(engine, notifier)
 
 
 if __name__ == "__main__":
