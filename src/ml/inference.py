@@ -24,7 +24,7 @@ from src.utils.logger import get_logger
 
 log = get_logger("ml_inference")
 
-DEFAULT_MODEL_PATH = os.path.join("models", "btc_ml_rf_1h.onnx")
+DEFAULT_MODEL_PATH = os.path.join("models", "btcusdt_ml_rf_1h.onnx")
 
 
 class MLSignalFilter:

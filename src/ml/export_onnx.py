@@ -35,7 +35,7 @@ from src.ml.train_model import make_model, select_features, load_dataset
 
 THRESHOLD = 0.60
 CONFIG = {
-    "symbol": "BTC",
+    "symbol": "BTCUSDT",
     "interval": "1h",
     "entry": "taker",
     "sl_atr_mult": 2.0,
@@ -70,8 +70,8 @@ def summarize_wf(results_csv: str) -> dict | None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="data/btc_1h3y_ml_dataset.csv")
-    ap.add_argument("--out", default="models/btc_ml_rf_1h.onnx")
+    ap.add_argument("--dataset", default="data/btcusdt_1h_market_ml_dataset.csv")
+    ap.add_argument("--out", default="models/btcusdt_ml_rf_1h.onnx")
     ap.add_argument("--threshold", type=float, default=THRESHOLD)
     ap.add_argument("--target", choices=["label_win", "label_trail"],
                     default="label_trail",
