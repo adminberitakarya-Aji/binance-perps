@@ -96,7 +96,7 @@ class DashboardState:
 
         # Header
         self.symbol        = "BTCUSDT"
-        self.interval      = "1H"
+        self.interval      = ""
         self.mode          = "TESTNET"
         self.bot_version   = "v2.0-binance"
 
@@ -277,7 +277,8 @@ def _build_indicators(s: DashboardState) -> Panel:
     ema_str   = _fmt_price(s.ema50)
     bull_bear = _bullish_bearish(s.mid_price, s.ema50)
     tbl.add_row("Last Price",  Text.from_markup(price_str))
-    tbl.add_row(f"EMA{s.interval} (50)", Text.assemble(Text.from_markup(ema_str), "  ", bull_bear))
+    ema_label = f"EMA{s.interval} (50)" if s.interval else "EMA (50)"
+    tbl.add_row(ema_label, Text.assemble(Text.from_markup(ema_str), "  ", bull_bear))
     tbl.add_row("─" * 20, "─" * 25)
 
     # ADX
@@ -548,6 +549,7 @@ class DashboardCollector(threading.Thread):
 
         updates: dict = {
             "symbol":   cfg.symbol,
+            "interval": eng.interval.upper(),   # dari config: 15m, 30m, 1h, dst.
             "mode":     "TESTNET" if cfg.use_testnet else "MAINNET",
             "ml_enabled": eng.ml_filter is not None,
             "ml_threshold": eng.ml_filter.threshold if eng.ml_filter else 0.70,
@@ -723,7 +725,7 @@ class DashboardRunner:
 
     def run_live(self, poll_fn, kill_switch_fn, poll_interval_s: int,
                  kill_switch_interval_s: int = 60,
-                 candle_buffer_s: int = 300):
+                 candle_buffer_s: int = 10):
         """
         Gantikan loop utama main.py: jalankan polling engine sambil
         merender dashboard Rich secara live.
@@ -733,7 +735,7 @@ class DashboardRunner:
             kill_switch_fn: callable untuk monitor kill switch
             poll_interval_s: interval poll (detik, selaras boundary candle)
             kill_switch_interval_s: interval cek kill switch
-            candle_buffer_s: detik buffer setelah candle close (default 300 = 5 menit)
+            candle_buffer_s: detik buffer setelah candle close (default 10 detik)
         """
         def _next_poll_ts() -> float:
             """Hitung timestamp poll berikutnya (boundary candle + buffer)."""
@@ -775,6 +777,13 @@ class DashboardRunner:
                         time.sleep(sleep_s)
                         try:
                             kill_switch_fn()
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception:
+                            pass
+                        # Deteksi fill DCA limit order & trailing stop secara real-time
+                        try:
+                            self.engine.manage_positions_tick()
                         except KeyboardInterrupt:
                             raise
                         except Exception:

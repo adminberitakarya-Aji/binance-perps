@@ -18,29 +18,37 @@ class RiskLimits:
     max_daily_loss_pct: float = 0.05   # kill switch harian otomatis (-5%)
     min_confidence: float = 0.5        # abaikan sinyal di bawah ini
 
-    # --- Mode TP/SL: "atr" (adaptif volatilitas) atau "pct" (% harga tetap) ---
+    # --- Mode TP/SL: "atr" (adaptif volatilitas), "pct" (% harga tetap), atau "point" (jarak fixed $) ---
     tpsl_mode: str = "atr"
     atr_sl_mult: float = 2.0           # SL = ATR * mult          [mode: atr]
     tp_rr_ratio: float = 1.5           # TP = jarak SL * rasio    [mode: atr]
     sl_pct: float = 0.5                # SL = sl_pct% dari entry  [mode: pct]
     tp_pct: float = 1.0                # TP = tp_pct% dari entry  [mode: pct]
+    sl_points: float = 300.0           # SL = sl_points ($) dari entry [mode: point]
+    tp_points: float = 450.0           # TP = tp_points ($) dari entry [mode: point]
 
     # --- Position sizing berbasis risiko (risk percent per trade) ---
     risk_per_trade_pct: float = 0.01   # 1% equity risiko per trade
 
     # --- Trailing stop (berbasis Average Entry Price) ---
     use_trailing: bool = True
-    trailing_start_atr_mult: float = 1.2    # Mulai trailing setelah profit >= ATR * mult dari avg entry
-    trailing_distance_atr_mult: float = 1.0  # Jarak SL baru di belakang harga berjalan
-    trailing_step_atr_mult: float = 0.3     # SL cuma digeser kalau pergerakan >= step ini (anti-churn)
+    trailing_start_atr_mult: float = 1.2    # Mulai trailing setelah profit >= ATR * mult dari avg entry [mode: atr]
+    trailing_distance_atr_mult: float = 1.0  # Jarak SL baru di belakang harga berjalan [mode: atr]
+    trailing_step_atr_mult: float = 0.3     # SL cuma digeser kalau pergerakan >= step ini (anti-churn) [mode: atr]
+    trailing_start_points: float = 200.0    # Mulai trailing setelah profit >= poin ($) dari avg entry [mode: point]
+    trailing_lock_points: float = 100.0     # SL awal yang dikunci (+poin $ dari avg entry) [mode: point]
+    trailing_step_points: float = 100.0     # Jarak milestone kenaikan berikutnya (+poin $) [mode: point]
+    trailing_move_points: float = 50.0      # Nilai pergeseran SL setiap milestone (+poin $) [mode: point]
 
     # --- Smart DCA / Grid Settings ---
     dca_enabled: bool = False               # true = izinkan penambahan lapis saat floating minus
     dca_max_orders: int = 3                 # Maksimal jumlah lapis (termasuk entry awal)
     dca_step_atr_mult: float = 1.5          # Jarak buka lapis berikutnya (ATR mult)  [mode: atr]
     dca_step_pct: float = 0.5              # Jarak buka lapis berikutnya (% harga)    [mode: pct]
+    dca_step_points: float = 200.0          # Jarak buka lapis berikutnya ($ poin)    [mode: point]
     dca_lot_multiplier: float = 1.0         # Pengali lot lapis berikutnya (1.0 = equal sizing)
     dca_tp_rr_ratio: float = 1.0            # TP gabungan = avg_price +/- (ATR * rasio) [mode: atr]
+    dca_tp_points: float = 200.0           # TP gabungan = avg_price +/- poin dollar [mode: point]
     dca_hard_sl_equity_pct: float = 0.03    # Cut-loss total jika floating loss >= 3% modal akun
 
 
@@ -85,7 +93,7 @@ class RiskManager:
         return position_size
 
     def compute_sl_tp(self, signal: Signal, entry_price: float, atr: float) -> tuple[float, float]:
-        """SL/TP awal: gunakan mode 'atr' (adaptif) atau 'pct' (% harga tetap).
+        """SL/TP awal: gunakan mode 'atr' (adaptif), 'pct' (% harga), atau 'point' (jarak fixed $).
 
         Jika DCA aktif (dca_enabled=True), jarak SL diletakkan di bawah seluruh lapis DCA
         agar Lapis 2 dan Lapis 3 memiliki ruang untuk averaging down tanpa tertabrak SL Lapis 1.
@@ -93,13 +101,21 @@ class RiskManager:
         if self.limits.tpsl_mode == "pct":
             tp_distance = entry_price * (self.limits.tp_pct / 100.0)
             if self.limits.dca_enabled and self.limits.dca_max_orders > 1:
-                # Total jarak SL = seluruh lapis DCA + buffer SL
                 total_drop_pct = (self.limits.dca_max_orders * self.limits.dca_step_pct) + self.limits.sl_pct
                 sl_distance = entry_price * (total_drop_pct / 100.0)
                 log.debug("DCA aktif (mode pct): SL diletakkan %.2f%% di bawah entry ($%.2f)", total_drop_pct, sl_distance)
             else:
                 sl_distance = entry_price * (self.limits.sl_pct / 100.0)
                 log.debug("Single entry (mode pct): SL=%.2f%% ($%.2f) TP=%.2f%% ($%.2f)", self.limits.sl_pct, sl_distance, self.limits.tp_pct, tp_distance)
+        elif self.limits.tpsl_mode == "point":
+            tp_distance = self.limits.tp_points
+            if self.limits.dca_enabled and self.limits.dca_max_orders > 1:
+                total_drop_pts = (self.limits.dca_max_orders * self.limits.dca_step_points) + self.limits.sl_points
+                sl_distance = total_drop_pts
+                log.debug("DCA aktif (mode point): SL diletakkan $%.2f di bawah entry", sl_distance)
+            else:
+                sl_distance = self.limits.sl_points
+                log.debug("Single entry (mode point): SL=$%.2f TP=$%.2f", sl_distance, tp_distance)
         else:  # mode atr (default)
             tp_distance = (atr * self.limits.atr_sl_mult) * self.limits.tp_rr_ratio
             if self.limits.dca_enabled and self.limits.dca_max_orders > 1:
@@ -130,7 +146,7 @@ class RiskManager:
         entry_atr: float,
         current_layer_count: int,
     ) -> bool:
-        """True jika harga saat ini sudah mencapai jarak step ATR untuk lapis berikutnya."""
+        """True jika harga saat ini sudah mencapai jarak step untuk lapis berikutnya."""
         if not self.limits.dca_enabled:
             return False
 
@@ -141,8 +157,9 @@ class RiskManager:
             return False
 
         if self.limits.tpsl_mode == "pct":
-            # Mode pct: jarak lapis = % dari harga lapis terakhir
             required_drop = last_layer_price * (self.limits.dca_step_pct / 100.0)
+        elif self.limits.tpsl_mode == "point":
+            required_drop = self.limits.dca_step_points
         else:
             # Mode atr: jarak lapis = ATR * multiplier
             if entry_atr <= 0:
@@ -150,10 +167,8 @@ class RiskManager:
             required_drop = entry_atr * self.limits.dca_step_atr_mult
 
         if signal == Signal.BUY:
-            # BUY: harga harus turun sebesar required_drop dari entry lapis terakhir
             return current_price <= (last_layer_price - required_drop)
         else:
-            # SELL: harga harus naik sebesar required_drop dari entry lapis terakhir
             return current_price >= (last_layer_price + required_drop)
 
     def compute_dca_layer_size(
@@ -167,6 +182,62 @@ class RiskManager:
         layer_size_usd = base_size_usd * mult
         max_size = equity_usd * self.limits.max_leverage
         return min(layer_size_usd, max_size)
+
+    def compute_dca_grid_plan(
+        self,
+        signal: Signal,
+        entry_price: float,
+        base_size_usd: float,
+        entry_atr: float,
+        equity_usd: float,
+    ) -> list[dict]:
+        """
+        Hitung rencana pre-placed limit orders untuk seluruh lapis DCA (Lapis 2, 3, ...).
+
+        Return list of dicts, satu per lapis:
+            {
+                "layer": int,         # nomor lapis (2, 3, ...)
+                "price": float,       # harga limit order
+                "size_usd": float,    # notional USD
+                "size_asset": float,  # quantity aset (BELUM dibulatkan ke stepSize)
+            }
+        """
+        if not self.limits.dca_enabled or self.limits.dca_max_orders <= 1:
+            return []
+
+        grid = []
+        last_price = entry_price
+
+        for layer_idx in range(1, self.limits.dca_max_orders):  # layer_idx 1 = Lapis 2
+            # ── Hitung harga lapis berikutnya ──────────────────────────────
+            if self.limits.tpsl_mode == "pct":
+                step = last_price * (self.limits.dca_step_pct / 100.0)
+            elif self.limits.tpsl_mode == "point":
+                step = self.limits.dca_step_points
+            else:
+                if entry_atr <= 0:
+                    break
+                step = entry_atr * self.limits.dca_step_atr_mult
+
+            if signal == Signal.BUY:
+                layer_price = last_price - step
+            else:  # SELL
+                layer_price = last_price + step
+
+            # ── Hitung ukuran lapis ────────────────────────────────────────
+            size_usd = self.compute_dca_layer_size(equity_usd, base_size_usd, layer_idx)
+            size_asset = size_usd / layer_price if layer_price > 0 else 0
+
+            grid.append({
+                "layer": layer_idx + 1,          # nomor lapis (2, 3, ...)
+                "price": round(layer_price, 2),
+                "size_usd": size_usd,
+                "size_asset": size_asset,
+            })
+
+            last_price = layer_price
+
+        return grid
 
     def compute_dca_avg_and_tp(
         self,
@@ -187,6 +258,8 @@ class RiskManager:
 
         if self.limits.tpsl_mode == "pct":
             tp_distance = avg_price * (self.limits.tp_pct / 100.0)
+        elif self.limits.tpsl_mode == "point":
+            tp_distance = self.limits.dca_tp_points if self.limits.dca_tp_points > 0 else self.limits.tp_points
         else:
             tp_distance = entry_atr * self.limits.dca_tp_rr_ratio
 
@@ -222,9 +295,42 @@ class RiskManager:
         """
         Trailing stop untuk posisi (single atau DCA multi-layer).
         Dihitung dari avg_entry_price.
+        Mendukung mode 'atr' (dinamis jarak ATR) dan 'point' (Discrete Step-Lock Trailing).
         Return SL baru (float) jika perlu digeser, atau None jika belum waktunya.
         """
-        if not self.limits.use_trailing or entry_atr <= 0:
+        if not self.limits.use_trailing:
+            return None
+
+        # ── Mode POINT: Discrete Step-Lock Trailing ────────────────────────
+        if self.limits.tpsl_mode == "point":
+            if self.limits.trailing_start_points <= 0:
+                return None
+
+            if signal == Signal.BUY:
+                profit_dist = current_price - avg_entry_price
+                if profit_dist < self.limits.trailing_start_points:
+                    return None
+                extra_profit = profit_dist - self.limits.trailing_start_points
+                steps = int(extra_profit // self.limits.trailing_step_points) if self.limits.trailing_step_points > 0 else 0
+                locked_profit = self.limits.trailing_lock_points + (steps * self.limits.trailing_move_points)
+                new_sl = avg_entry_price + locked_profit
+                if current_sl is None or current_sl <= 0 or new_sl > (current_sl + 1e-6):
+                    return round(new_sl, 2)
+                return None
+            else:  # SELL
+                profit_dist = avg_entry_price - current_price
+                if profit_dist < self.limits.trailing_start_points:
+                    return None
+                extra_profit = profit_dist - self.limits.trailing_start_points
+                steps = int(extra_profit // self.limits.trailing_step_points) if self.limits.trailing_step_points > 0 else 0
+                locked_profit = self.limits.trailing_lock_points + (steps * self.limits.trailing_move_points)
+                new_sl = avg_entry_price - locked_profit
+                if current_sl is None or current_sl <= 0 or new_sl < (current_sl - 1e-6):
+                    return round(new_sl, 2)
+                return None
+
+        # ── Mode ATR (default) ─────────────────────────────────────────────
+        if entry_atr <= 0:
             return None
 
         trail_start_dist = entry_atr * self.limits.trailing_start_atr_mult

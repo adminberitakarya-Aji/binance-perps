@@ -11,7 +11,7 @@ from src.utils.logger import get_logger
 from src.utils.notifier import TelegramNotifier
 
 POLL_INTERVAL_SECONDS = 3600       # default fallback 1H (BTC 1H)
-CANDLE_CLOSE_BUFFER_SECONDS = 300  # jeda setelah close candle (data siap di API)
+CANDLE_CLOSE_BUFFER_SECONDS = 10   # jeda setelah close candle (10 detik agar kline siap di API)
 KILL_SWITCH_CHECK_SECONDS = 60    # monitoring kill switch antar-poll
 
 # Mapping timeframe ke detik (untuk hitung poll interval dinamis)
@@ -35,6 +35,7 @@ def seconds_until_next_poll(
     return max(target - now, 1.0)
 
 
+
 def build_engine(config: Config) -> tuple[TradingEngine, TelegramNotifier, object]:
     """Bangun semua komponen engine dan kembalikan (engine, notifier, ml_filter)."""
     client   = BinanceFuturesClient(config)
@@ -56,17 +57,25 @@ def build_engine(config: Config) -> tuple[TradingEngine, TelegramNotifier, objec
         tp_rr_ratio=config.tp_rr_ratio,
         sl_pct=config.sl_pct,
         tp_pct=config.tp_pct,
+        sl_points=config.sl_points,
+        tp_points=config.tp_points,
         risk_per_trade_pct=config.risk_per_trade_pct,
         use_trailing=config.trailing_enabled,
         trailing_start_atr_mult=config.trailing_start_atr_mult,
         trailing_distance_atr_mult=config.trailing_distance_atr_mult,
         trailing_step_atr_mult=config.trailing_step_atr_mult,
+        trailing_start_points=config.trailing_start_points,
+        trailing_lock_points=config.trailing_lock_points,
+        trailing_step_points=config.trailing_step_points,
+        trailing_move_points=config.trailing_move_points,
         dca_enabled=config.dca_enabled,
         dca_max_orders=config.dca_max_orders,
         dca_step_atr_mult=config.dca_step_atr_mult,
         dca_step_pct=config.dca_step_pct,
+        dca_step_points=config.dca_step_points,
         dca_lot_multiplier=config.dca_lot_multiplier,
         dca_tp_rr_ratio=config.dca_tp_rr_ratio,
+        dca_tp_points=config.dca_tp_points,
         dca_hard_sl_equity_pct=config.dca_hard_sl_equity_pct,
     )
     risk_manager = RiskManager(limits)
@@ -121,7 +130,7 @@ def run_plain(engine: TradingEngine, notifier: TelegramNotifier):
                 log.error("Error saat monitor kill switch: %s", e)
 
 
-def run_dashboard(engine: TradingEngine, notifier: TelegramNotifier, ml_filter):
+def run_dashboard(engine: TradingEngine, notifier: TelegramNotifier, ml_filter, poll_interval_s: int = 3600):
     """Loop utama dengan dashboard terminal visual (mode Rich)."""
     from src.ui.dashboard import (
         DashboardRunner,
@@ -144,8 +153,9 @@ def run_dashboard(engine: TradingEngine, notifier: TelegramNotifier, ml_filter):
     runner.run_live(
         poll_fn=engine.run_once,
         kill_switch_fn=engine.monitor_kill_switch,
-        poll_interval_s=POLL_INTERVAL_SECONDS,
+        poll_interval_s=poll_interval_s,
         kill_switch_interval_s=KILL_SWITCH_CHECK_SECONDS,
+        candle_buffer_s=CANDLE_CLOSE_BUFFER_SECONDS,
     )
 
 
@@ -184,7 +194,7 @@ def main():
     )
 
     if args.dashboard:
-        run_dashboard(engine, notifier, ml_filter)
+        run_dashboard(engine, notifier, ml_filter, poll_interval)
     else:
         run_plain_with_interval(engine, notifier, poll_interval)
 
@@ -211,6 +221,10 @@ def run_plain_with_interval(engine: TradingEngine, notifier: TelegramNotifier, p
                 engine.monitor_kill_switch()
             except Exception as e:
                 log.error("Error saat monitor kill switch: %s", e)
+            try:
+                engine.manage_positions_tick()
+            except Exception as e:
+                log.error("Error saat manage_positions_tick: %s", e)
 
 
 if __name__ == "__main__":

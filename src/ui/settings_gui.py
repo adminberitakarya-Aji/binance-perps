@@ -28,11 +28,13 @@ PARAMETERS_SCHEMA = [
     ("ML_MODEL_PATH", "Model Path (kosongkan = default models/*.onnx)", "str", "", None, None, "Lokasi file model .onnx"),
 
     # ===== STRATEGI & MODE TP/SL =====
-    ("TPSL_MODE", "Mode Perhitungan TP/SL ('atr' atau 'pct')", "choice", "atr", ["atr", "pct"], "===== STRATEGI & MODE TP/SL =====", "Pilihan dasar kalkulasi SL/TP & DCA"),
+    ("TPSL_MODE", "Mode Perhitungan TP/SL ('atr', 'pct', atau 'point')", "choice", "atr", ["atr", "pct", "point"], "===== STRATEGI & MODE TP/SL =====", "Pilihan dasar kalkulasi SL/TP & DCA"),
     ("ATR_SL_MULT", "Jarak SL Awal (ATR Multiplier - jika mode ATR)", "float", "2.0", None, None, "Kelipatan ATR untuk SL awal"),
     ("TP_RR_RATIO", "Target TP Ratio (RR Multiplier - jika mode ATR)", "float", "1.5", None, None, "Rasio Take Profit terhadap jarak SL"),
     ("SL_PCT", "Stop Loss % dari Entry (jika mode PCT)", "float", "0.5", None, None, "Jarak SL dalam persen nominal harga"),
     ("TP_PCT", "Take Profit % dari Entry (jika mode PCT)", "float", "1.0", None, None, "Jarak TP dalam persen nominal harga"),
+    ("SL_POINTS", "Stop Loss Poin/$ dari Entry (jika mode POINT)", "float", "300.0", None, None, "Jarak SL dalam nominal dollar ($) / poin"),
+    ("TP_POINTS", "Take Profit Poin/$ dari Entry (jika mode POINT)", "float", "450.0", None, None, "Jarak TP dalam nominal dollar ($) / poin"),
 
     # ===== MONEY MANAGEMENT & RISK =====
     ("RISK_PER_TRADE_PCT", "Risk % Equity per Trade (0.01 = 1% modal)", "float", "0.01", None, "===== MONEY MANAGEMENT & RISK =====", "Persentase risiko kerugian modal per posisi"),
@@ -44,15 +46,21 @@ PARAMETERS_SCHEMA = [
     ("DCA_MAX_ORDERS", "Maksimal Level Averaging Tambahan (default: 3)", "int", "3", None, None, "Jumlah total lapis order maksimal"),
     ("DCA_STEP_ATR_MULT", "Jarak Lapis DCA (ATR Mult - jika mode ATR)", "float", "1.5", None, None, "Jarak buka lapis berikutnya berbasis ATR"),
     ("DCA_STEP_PCT", "Jarak Lapis DCA (% Harga - jika mode PCT)", "float", "0.5", None, None, "Jarak buka lapis berikutnya berbasis persen"),
+    ("DCA_STEP_POINTS", "Jarak Lapis DCA (Poin/$ - jika mode POINT)", "float", "200.0", None, None, "Jarak buka lapis berikutnya dalam poin dollar ($)"),
     ("DCA_LOT_MULTIPLIER", "Pengali Lot Tiap Level (1.0 = equal, 1.5x)", "float", "1.0", None, None, "Multiplier ukuran lot untuk lapis baru"),
-    ("DCA_TP_RR_RATIO", "Target Profit Gabungan dari Avg Price (RR)", "float", "1.5", None, None, "Target TP keranjang dari average entry price"),
+    ("DCA_TP_RR_RATIO", "Target Profit Gabungan dari Avg Price (RR - ATR)", "float", "1.5", None, None, "Target TP keranjang dari average entry price (mode ATR)"),
+    ("DCA_TP_POINTS", "Target Profit Gabungan dari Avg Price (Poin/$)", "float", "200.0", None, None, "Target TP keranjang dari average entry price dalam dollar ($)"),
     ("DCA_HARD_SL_EQUITY_PCT", "Cut-Loss Darurat Floating (% Saldo, mis. 0.03)", "float", "0.03", None, None, "Batas darurat kerugian keranjang total"),
 
     # ===== TRAILING STOP (AVERAGE POSITION) =====
     ("TRAILING_ENABLED", "Aktifkan Average-Price Trailing Stop", "bool", "true", ["true", "false"], "===== TRAILING STOP (AVERAGE POSITION) =====", "Kunci profit berjalan secara otomatis"),
-    ("TRAILING_START_ATR_MULT", "Aktivasi Trailing Profit (ATR Multiplier)", "float", "1.5", None, None, "Floating profit minimal untuk mulai trailing"),
-    ("TRAILING_DISTANCE_ATR_MULT", "Jarak Trailing Mundur di Belakang Harga (ATR)", "float", "1.0", None, None, "Jarak SL baru dari harga tertinggi/terendah"),
-    ("TRAILING_STEP_ATR_MULT", "Minimal Pergeseran Harga Update SL (ATR)", "float", "0.3", None, None, "Langkah minimal pergeseran harga"),
+    ("TRAILING_START_ATR_MULT", "Aktivasi Trailing Profit (ATR Mult - mode ATR)", "float", "1.5", None, None, "Floating profit minimal untuk mulai trailing (mode ATR)"),
+    ("TRAILING_DISTANCE_ATR_MULT", "Jarak Trailing Mundur di Belakang Harga (ATR)", "float", "1.0", None, None, "Jarak SL baru dari harga tertinggi/terendah (mode ATR)"),
+    ("TRAILING_STEP_ATR_MULT", "Minimal Pergeseran Harga Update SL (ATR)", "float", "0.3", None, None, "Langkah minimal pergeseran harga (mode ATR)"),
+    ("TRAILING_START_POINTS", "Aktivasi Trailing Profit (Poin/$ - mode POINT)", "float", "200.0", None, None, "Floating profit ($) minimal untuk mulai trailing"),
+    ("TRAILING_LOCK_POINTS", "SL Awal Terkunci Saat Aktif (Poin/$ - mode POINT)", "float", "100.0", None, None, "Nominal profit ($) yang dikunci ke SL saat awal aktif"),
+    ("TRAILING_STEP_POINTS", "Milestone Kenaikan Harga (Poin/$ - mode POINT)", "float", "100.0", None, None, "Jarak pergerakan harga untuk step trailing berikutnya ($)"),
+    ("TRAILING_MOVE_POINTS", "Pergeseran SL per Milestone (Poin/$ - mode POINT)", "float", "50.0", None, None, "Besar pergeseran SL maju mengunci profit setiap milestone ($)"),
 ]
 
 

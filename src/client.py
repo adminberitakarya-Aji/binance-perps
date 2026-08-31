@@ -252,6 +252,34 @@ class BinanceFuturesClient:
 
     # ------------------------------------------------------------------
     # Orders & Execution
+    def place_limit_order(
+        self,
+        symbol: str,
+        is_buy: bool,
+        size: float,
+        price: float,
+        reduce_only: bool = False,
+    ) -> dict:
+        """Kirim Limit Order (GTC) ke exchange Binance USDⓈ-M Futures."""
+        side = "BUY" if is_buy else "SELL"
+        qty = self.round_size(symbol, size)
+        px = self.round_price(symbol, price)
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "LIMIT",
+            "timeInForce": "GTC",
+            "quantity": qty,
+            "price": px,
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+
+        return validate_order_result(
+            self._request("POST", "/fapi/v1/order", params, signed=True),
+            f"limit order {symbol} {side} {qty} @ {px}",
+        )
+
     def place_market_order_raw(self, symbol: str, is_buy: bool, size: float) -> dict:
         """Kirim market order murni tanpa proteksi SL/TP otomatis (dipakai DCA layer)."""
         side = "BUY" if is_buy else "SELL"
@@ -455,6 +483,34 @@ class BinanceFuturesClient:
             except Exception as e:
                 log.warning("gagal cancel trigger oid=%s: %s", o.get("oid"), e)
         return n
+
+    def get_open_limit_orders(self, symbol: str) -> list:
+        """Query semua regular open limit orders untuk satu simbol."""
+        try:
+            orders = self._request("GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
+            if isinstance(orders, list):
+                return [o for o in orders if o.get("type") == "LIMIT"]
+            return []
+        except Exception as e:
+            log.warning("gagal query open limit orders %s: %s", symbol, e)
+            return []
+
+    def cancel_all_open_orders(self, symbol: str) -> bool:
+        """Cancel semua open limit orders biasa untuk satu simbol."""
+        try:
+            res = self._request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol}, signed=True)
+            log.info("[%s] Semua open limit orders dibatalkan: %s", symbol, res)
+            return True
+        except Exception as e:
+            log.warning("[%s] gagal cancel all open orders: %s", symbol, e)
+            # Fallback iterasi satu per satu
+            limit_orders = self.get_open_limit_orders(symbol)
+            for o in limit_orders:
+                try:
+                    self.cancel_order(symbol, o.get("orderId"))
+                except Exception:
+                    pass
+            return False
 
     def modify_sl_trigger(
         self,

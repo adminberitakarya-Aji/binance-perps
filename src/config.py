@@ -34,7 +34,7 @@ class Config:
     ml_threshold: float = 0.60
     ml_model_path: str = ""  # kosong = default models/btcusdt_ml_rf_1h.onnx
 
-    # Mode TP/SL: "atr" (adaptif volatilitas) atau "pct" (% harga fixed)
+    # Mode TP/SL: "atr" (adaptif volatilitas), "pct" (% harga fixed), atau "point" (jarak fixed USD/poin)
     tpsl_mode: str = "atr"
 
     # Risk Management Settings
@@ -45,20 +45,28 @@ class Config:
     tp_rr_ratio: float = 1.5              # TP awal = jarak SL * rasio [dipakai jika tpsl_mode=atr]
     sl_pct: float = 0.5                   # SL = sl_pct% dari harga entry  [dipakai jika tpsl_mode=pct]
     tp_pct: float = 1.0                   # TP = tp_pct% dari harga entry  [dipakai jika tpsl_mode=pct]
+    sl_points: float = 300.0              # SL = jarak poin/dollar ($) dari entry [dipakai jika tpsl_mode=point]
+    tp_points: float = 450.0              # TP = jarak poin/dollar ($) dari entry [dipakai jika tpsl_mode=point]
 
     # Trailing Stop Settings
     trailing_enabled: bool = True
-    trailing_start_atr_mult: float = 1.2  # Mulai trailing setelah profit >= ATR * mult dari avg entry
-    trailing_distance_atr_mult: float = 1.0 # Jarak SL baru di belakang harga berjalan
-    trailing_step_atr_mult: float = 0.3   # Minimal pergeseran harga untuk update SL
+    trailing_start_atr_mult: float = 1.2  # Mulai trailing setelah profit >= ATR * mult dari avg entry [mode atr]
+    trailing_distance_atr_mult: float = 1.0 # Jarak SL baru di belakang harga berjalan [mode atr]
+    trailing_step_atr_mult: float = 0.3   # Minimal pergeseran harga untuk update SL [mode atr]
+    trailing_start_points: float = 200.0  # Trigger mulai trailing (+poin dari avg entry) [mode point]
+    trailing_lock_points: float = 100.0   # SL awal yang dikunci (+poin dari avg entry) [mode point]
+    trailing_step_points: float = 100.0   # Jarak milestone kenaikan berikutnya (+poin) [mode point]
+    trailing_move_points: float = 50.0    # Nilai pergeseran SL setiap milestone (+poin) [mode point]
 
     # Smart DCA / Grid Settings
     dca_enabled: bool = False             # true = aktifkan averaging down, false = single entry
     dca_max_orders: int = 3               # Maksimal jumlah lapis (termasuk entry awal)
     dca_step_atr_mult: float = 1.5        # Jarak buka lapis berikutnya (tiap minus 1.5x ATR) [mode atr]
     dca_step_pct: float = 0.5            # Jarak buka lapis berikutnya (% harga lapis sebelumnya) [mode pct]
+    dca_step_points: float = 200.0        # Jarak buka lapis berikutnya ($ poin dari lapis sebelumnya) [mode point]
     dca_lot_multiplier: float = 1.0       # Pengali lot lapis berikutnya (1.0 = equal size)
     dca_tp_rr_ratio: float = 1.0          # TP gabungan = average_entry +/- (ATR * rasio) [mode atr]
+    dca_tp_points: float = 200.0          # TP gabungan = average_entry +/- poin dollar [mode point]
     dca_hard_sl_equity_pct: float = 0.03  # Cut-loss total jika floating loss >= 3% modal
 
     @property
@@ -94,10 +102,12 @@ class Config:
         ml_threshold = float(os.environ.get("ML_THRESHOLD", "0.60"))
         ml_model_path = (os.environ.get("ML_MODEL_PATH") or "").strip()
 
-        # Mode TP/SL
+        # Mode TP/SL: atr, pct, atau point
         tpsl_mode = os.environ.get("TPSL_MODE", "atr").strip().lower()
-        if tpsl_mode not in ("atr", "pct"):
-            raise ValueError(f"TPSL_MODE harus 'atr' atau 'pct', bukan '{tpsl_mode}'")
+        if tpsl_mode in ("points", "usd"):
+            tpsl_mode = "point"
+        if tpsl_mode not in ("atr", "pct", "point"):
+            raise ValueError(f"TPSL_MODE harus 'atr', 'pct', atau 'point', bukan '{tpsl_mode}'")
 
         # Risk
         risk_per_trade_pct = float(os.environ.get("RISK_PER_TRADE_PCT", "0.01"))
@@ -107,20 +117,28 @@ class Config:
         tp_rr_ratio = float(os.environ.get("TP_RR_RATIO", "1.5"))
         sl_pct = float(os.environ.get("SL_PCT", "0.5"))
         tp_pct = float(os.environ.get("TP_PCT", "1.0"))
+        sl_points = float(os.environ.get("SL_POINTS", "300.0"))
+        tp_points = float(os.environ.get("TP_POINTS", "450.0"))
 
         # Trailing
         trailing_enabled = os.environ.get("TRAILING_ENABLED", "true").lower() == "true"
         trailing_start_atr_mult = float(os.environ.get("TRAILING_START_ATR_MULT", "1.2"))
         trailing_distance_atr_mult = float(os.environ.get("TRAILING_DISTANCE_ATR_MULT", "1.0"))
         trailing_step_atr_mult = float(os.environ.get("TRAILING_STEP_ATR_MULT", "0.3"))
+        trailing_start_points = float(os.environ.get("TRAILING_START_POINTS", "200.0"))
+        trailing_lock_points = float(os.environ.get("TRAILING_LOCK_POINTS", "100.0"))
+        trailing_step_points = float(os.environ.get("TRAILING_STEP_POINTS", "100.0"))
+        trailing_move_points = float(os.environ.get("TRAILING_MOVE_POINTS", "50.0"))
 
         # DCA
         dca_enabled = os.environ.get("DCA_ENABLED", "false").lower() == "true"
         dca_max_orders = int(os.environ.get("DCA_MAX_ORDERS", "3"))
         dca_step_atr_mult = float(os.environ.get("DCA_STEP_ATR_MULT", "1.5"))
         dca_step_pct = float(os.environ.get("DCA_STEP_PCT", "0.5"))
+        dca_step_points = float(os.environ.get("DCA_STEP_POINTS", "200.0"))
         dca_lot_multiplier = float(os.environ.get("DCA_LOT_MULTIPLIER", "1.0"))
         dca_tp_rr_ratio = float(os.environ.get("DCA_TP_RR_RATIO", "1.0"))
+        dca_tp_points = float(os.environ.get("DCA_TP_POINTS", "200.0"))
         dca_hard_sl_equity_pct = float(os.environ.get("DCA_HARD_SL_EQUITY_PCT", "0.03"))
 
         return cls(
@@ -142,15 +160,23 @@ class Config:
             tp_rr_ratio=tp_rr_ratio,
             sl_pct=sl_pct,
             tp_pct=tp_pct,
+            sl_points=sl_points,
+            tp_points=tp_points,
             trailing_enabled=trailing_enabled,
             trailing_start_atr_mult=trailing_start_atr_mult,
             trailing_distance_atr_mult=trailing_distance_atr_mult,
             trailing_step_atr_mult=trailing_step_atr_mult,
+            trailing_start_points=trailing_start_points,
+            trailing_lock_points=trailing_lock_points,
+            trailing_step_points=trailing_step_points,
+            trailing_move_points=trailing_move_points,
             dca_enabled=dca_enabled,
             dca_max_orders=dca_max_orders,
             dca_step_atr_mult=dca_step_atr_mult,
             dca_step_pct=dca_step_pct,
+            dca_step_points=dca_step_points,
             dca_lot_multiplier=dca_lot_multiplier,
             dca_tp_rr_ratio=dca_tp_rr_ratio,
+            dca_tp_points=dca_tp_points,
             dca_hard_sl_equity_pct=dca_hard_sl_equity_pct,
         )

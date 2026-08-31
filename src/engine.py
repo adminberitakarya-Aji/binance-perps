@@ -200,6 +200,8 @@ class TradingEngine:
             sl_distance_pct = None
             if self.risk_manager.limits.tpsl_mode == "pct":
                 sl_distance_pct = self.risk_manager.limits.sl_pct / 100.0
+            elif self.risk_manager.limits.tpsl_mode == "point":
+                sl_distance_pct = self.risk_manager.limits.sl_points / snapshot.mid_price if snapshot.mid_price > 0 else None
             elif atr is not None and atr > 0 and snapshot.mid_price > 0:
                 sl_distance_pct = (atr * self.risk_manager.limits.atr_sl_mult) / snapshot.mid_price
 
@@ -213,10 +215,10 @@ class TradingEngine:
             )
 
             if size_usd > 0:
-                if atr is None or atr <= 0:
+                if self.risk_manager.limits.tpsl_mode == "atr" and (atr is None or atr <= 0):
                     log.warning("[%s] ATR tidak tersedia -> skip entry (butuh SL/TP valid)", symbol)
                     continue
-                sl, tp = self.risk_manager.compute_sl_tp(result.signal, snapshot.mid_price, atr)
+                sl, tp = self.risk_manager.compute_sl_tp(result.signal, snapshot.mid_price, atr or 0.0)
                 exec_result = self.executor.execute(
                     symbol, result.signal, size_usd, snapshot.mid_price, sl=sl, tp=tp
                 )
@@ -233,13 +235,29 @@ class TradingEngine:
                         "layers": [
                             {"price": snapshot.mid_price, "size": size_asset, "atr": atr}
                         ],
+                        "pending_dca_orders": [],  # will be populated by grid placement below
                     }
                     self._save_state()
                     log.info(
-                        "posisi %s dicatat: side=%s SL=%s TP=%s (Lapis 1/ %d)",
+                        "posisi %s dicatat: side=%s SL=%s TP=%s (Lapis 1/%d)",
                         symbol, self.live_positions[symbol]["side"], sl, tp,
                         self.risk_manager.limits.dca_max_orders,
                     )
+
+                    # --- PASANG PRE-PLACED LIMIT ORDERS DCA (GRID) ---
+                    if self.risk_manager.limits.dca_enabled and self.risk_manager.limits.dca_max_orders > 1:
+                        grid_plan = self.risk_manager.compute_dca_grid_plan(
+                            result.signal, snapshot.mid_price, size_usd, atr, equity_usd
+                        )
+                        if grid_plan:
+                            placed = self.executor.place_dca_limit_grid(symbol, result.signal, grid_plan)
+                            self.live_positions[symbol]["pending_dca_orders"] = placed
+                            self._save_state()
+                            log.info(
+                                "[%s] Grid DCA terpasang: %d limit orders di exchange",
+                                symbol, len([p for p in placed if p["status"] == "PLACED"]),
+                            )
+
                     self.notifier.notify_entry(
                         symbol=symbol,
                         signal=result.signal.value,
@@ -254,16 +272,16 @@ class TradingEngine:
                     )
 
     # ------------------------------------------------------------------
-    # Manajemen posisi terbuka: Hard SL, Smart DCA, trailing SL
+    # Manajemen posisi terbuka: Hard SL, Grid DCA fill detection, trailing SL
     # ------------------------------------------------------------------
     def _manage_open_positions(self, symbol: str):
         state = self.live_positions.get(symbol)
         pos = self.client.get_position(symbol)
 
-        # 1. Posisi sudah tertutup -> bersihkan
+        # 1. Posisi sudah tertutup -> bersihkan + cancel semua sisa DCA limit orders
         if pos is None:
             if state is not None:
-                log.info("[%s] posisi sudah tertutup -> hapus state & cancel trigger sisa", symbol)
+                log.info("[%s] posisi sudah tertutup -> hapus state & cancel semua order sisa", symbol)
                 self.notifier.notify_closed(
                     symbol,
                     state.get("side", "?"),
@@ -275,8 +293,9 @@ class TradingEngine:
                 self._save_state()
             try:
                 self.client.cancel_all_trigger_orders(symbol)
+                self.client.cancel_all_open_orders(symbol)   # batalkan sisa limit DCA gantung
             except Exception as e:
-                log.warning("[%s] cleanup trigger gagal: %s", symbol, e)
+                log.warning("[%s] cleanup order gagal: %s", symbol, e)
             return
 
         # 2. Posisi ada tapi state hilang: rekonstruksi state minimal
@@ -291,6 +310,7 @@ class TradingEngine:
                 "sl": None,
                 "tp": None,
                 "layers": [{"price": pos["entryPx"], "size": abs(pos["szi"])}],
+                "pending_dca_orders": [],
             }
             self._save_state()
             return
@@ -299,7 +319,6 @@ class TradingEngine:
         mid_px = self.client.get_mid_price(symbol)
 
         # 3. --- HARD SL CUT-LOSS DARURAT ---
-        # Jika total kerugian keranjang >= batas darurat (misal 3% modal) -> TUTUP PAKSA
         unrealized_pnl = float(pos.get("unrealizedPnl") or 0)
         if equity and unrealized_pnl < 0:
             floating_loss_usd = abs(unrealized_pnl)
@@ -309,6 +328,7 @@ class TradingEngine:
                     symbol, floating_loss_usd, self.risk_manager.limits.dca_hard_sl_equity_pct * 100
                 )
                 try:
+                    self.client.cancel_all_open_orders(symbol)     # cancel sisa DCA limit
                     self.client.cancel_all_trigger_orders(symbol)
                     self.client.market_close_position(symbol)
                 except Exception as e:
@@ -322,58 +342,87 @@ class TradingEngine:
                 self._save_state()
                 return
 
-        # 4. --- SMART DCA / AVERAGING DOWN ---
+        # 4. --- DETEKSI FILL DCA LIMIT ORDERS (GRID) ---
+        # Cek apakah size posisi di Binance bertambah karena limit order DCA terisi.
         if self.risk_manager.limits.dca_enabled and state.get("entry_atr"):
             layers = state.get("layers", [])
-            if not layers:
-                layers = [{"price": state["entry_price"], "size": abs(pos["szi"]), "atr": state["entry_atr"]}]
-                state["layers"] = layers
-                state["avg_price"] = state["entry_price"]
-                state["total_size"] = abs(pos["szi"])
+            pending = state.get("pending_dca_orders", [])
+            signal = Signal.BUY if state["side"] == "B" else Signal.SELL
+            entry_atr = state["entry_atr"]
+
+            actual_size = abs(pos.get("szi", 0))
+            recorded_size = state.get("total_size", 0)
+
+            # Toleransi 1 step-size untuk menghindari false-positive floating-point
+            filters = self.client.get_symbol_filters(symbol)
+            step_size = filters.get("stepSize", 0.001)
+
+            if actual_size > recorded_size + step_size and len(layers) < self.risk_manager.limits.dca_max_orders:
+                # Cari lapis yang baru saja terisi
+                filled_size_delta = actual_size - recorded_size
+                log.info(
+                    "[%s] FILL DCA TERDETEKSI: size exchange=%.4f, recorded=%.4f, delta=+%.4f",
+                    symbol, actual_size, recorded_size, filled_size_delta
+                )
+
+                # Identifikasi lapis yang terisi dari pending_dca_orders
+                filled_layer = None
+                for p in pending:
+                    if abs(p.get("size_asset", 0) - filled_size_delta) <= step_size * 2:
+                        filled_layer = p
+                        break
+
+                # Harga fill: gunakan entryPx Binance (rata-rata baru dari exchange)
+                fill_price = float(pos.get("entryPx", mid_px))
+                fill_size = filled_size_delta
+
+                new_layer = {"price": fill_price, "size": fill_size, "atr": entry_atr}
+                new_layers = layers + [new_layer]
+                new_avg_px, new_tot_sz, new_tp = self.risk_manager.compute_dca_avg_and_tp(
+                    signal, new_layers, entry_atr
+                )
+
+                # Update state
+                state["layers"] = new_layers
+                state["avg_price"] = new_avg_px
+                state["total_size"] = new_tot_sz
+                state["tp"] = new_tp
+
+                # Hapus entry pending yang sudah terisi
+                if filled_layer is not None:
+                    state["pending_dca_orders"] = [
+                        p for p in pending if p.get("orderId") != filled_layer.get("orderId")
+                    ]
+
                 self._save_state()
 
-            if len(layers) < self.risk_manager.limits.dca_max_orders:
-                last_layer_price = layers[-1]["price"]
-                signal = Signal.BUY if state["side"] == "B" else Signal.SELL
-                entry_atr = state["entry_atr"]
+                # Update TP/SL bracket di exchange
+                close_is_buy = state["side"] == "S"
+                try:
+                    self.client.cancel_all_trigger_orders(symbol)
+                    tot_size_rounded = self.client.round_size(symbol, new_tot_sz)
+                    self.client.place_tpsl_pair(symbol, close_is_buy, tot_size_rounded, state.get("sl"), new_tp)
+                    log.info(
+                        "[%s] DCA Lapis %d FILL: Avg Px=%.2f Total=%.4f New TP=%.2f",
+                        symbol, len(new_layers), new_avg_px, new_tot_sz, new_tp
+                    )
+                except Exception as e:
+                    log.error("[%s] gagal update TP/SL setelah fill DCA: %s", symbol, e)
 
-                if self.risk_manager.should_trigger_dca(signal, last_layer_price, mid_px, entry_atr, len(layers)):
-                    base_size_usd = layers[0]["size"] * layers[0]["price"]
-                    layer_idx = len(layers)
-                    layer_size_usd = self.risk_manager.compute_dca_layer_size(equity or 5000.0, base_size_usd, layer_idx)
-                    layer_size_asset = self.client.round_size(symbol, layer_size_usd / mid_px)
-
-                    if layer_size_asset > 0:
-                        sim_layers = layers + [{"price": mid_px, "size": layer_size_asset, "atr": entry_atr}]
-                        new_avg_px, new_tot_sz, new_tp = self.risk_manager.compute_dca_avg_and_tp(signal, sim_layers, entry_atr)
-                        new_sl = state.get("sl")
-
-                        fill = self.executor.execute_dca_layer(
-                            symbol, signal, layer_size_usd, mid_px, new_tot_sz, new_sl, new_tp, layer_idx
-                        )
-                        if fill is not None:
-                            state["layers"] = sim_layers
-                            state["avg_price"] = new_avg_px
-                            state["total_size"] = new_tot_sz
-                            state["tp"] = new_tp
-                            self._save_state()
-                            log.info(
-                                "[%s] DCA Lapis %d BERHASIL: Size +%s (Total=%s), Avg Px=%s, New TP=%s",
-                                symbol, len(sim_layers), layer_size_asset, new_tot_sz, new_avg_px, new_tp
-                            )
-                            self.notifier.notify_entry(
-                                symbol=symbol,
-                                signal=f"DCA Lapis {len(sim_layers)}/{self.risk_manager.limits.dca_max_orders}",
-                                size=layer_size_asset,
-                                size_usd=layer_size_usd,
-                                price=mid_px,
-                                sl=new_sl,
-                                tp=new_tp,
-                                confidence=0.9,
-                                equity=equity or 0,
-                                reason=f"Averaging down: Avg Px -> ${new_avg_px:,.2f}",
-                            )
-                            return
+                # Notifikasi
+                self.notifier.notify_entry(
+                    symbol=symbol,
+                    signal=f"DCA Lapis {len(new_layers)}/{self.risk_manager.limits.dca_max_orders} FILL",
+                    size=fill_size,
+                    size_usd=fill_size * fill_price,
+                    price=fill_price,
+                    sl=state.get("sl"),
+                    tp=new_tp,
+                    confidence=0.9,
+                    equity=equity or 0,
+                    reason=f"Limit order DCA terisi -> Avg Px ${new_avg_px:,.2f}",
+                )
+                return
 
         # 5. --- SL guard (self-healing): posisi TIDAK boleh telanjang ---
         trigger_active = self.client.get_trigger_orders(symbol)
@@ -395,10 +444,10 @@ class TradingEngine:
                 return
 
         # 6. --- TRAILING STOP BERBASIS AVERAGE ENTRY PRICE ---
-        if self.risk_manager.limits.use_trailing and state.get("entry_atr") and state.get("sl") is not None:
+        if self.risk_manager.limits.use_trailing and state.get("sl") is not None and (self.risk_manager.limits.tpsl_mode == "point" or state.get("entry_atr")):
             signal = Signal.BUY if state["side"] == "B" else Signal.SELL
             avg_price = state.get("avg_price", state["entry_price"])
-            entry_atr = state["entry_atr"]
+            entry_atr = state.get("entry_atr") or 0.0
 
             new_sl = self.risk_manager.compute_trailing_sl(
                 signal, avg_price, mid_px, state["sl"], entry_atr
@@ -421,6 +470,17 @@ class TradingEngine:
                 self.notifier.notify_trailing(symbol, old_sl, new_sl, mid_px)
             except Exception as e:
                 log.error("[%s] gagal modify SL: %s", symbol, e)
+
+    def manage_positions_tick(self):
+        """
+        Fast-loop position management: deteksi fill DCA limit orders & trailing stop.
+        Dipanggil setiap beberapa detik di loop antar-candle (bukan hanya saat candle close).
+        """
+        for symbol in self.symbols:
+            try:
+                self._manage_open_positions(symbol)
+            except Exception as e:
+                log.error("[%s] error manage_positions_tick: %s", symbol, e)
 
     def monitor_kill_switch(self):
         """Cek PnL harian/kill switch di luar siklus poll utama."""

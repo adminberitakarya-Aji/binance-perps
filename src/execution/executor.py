@@ -68,7 +68,7 @@ class OrderExecutor:
         layer_index: int,
     ):
         """
-        Eksekusi penambahan lapis DCA (Lapis 2, 3, dst):
+        Eksekusi penambahan lapis DCA (Lapis 2, 3, dst) via Market Order:
         1. Kirim market order untuk menambah size
         2. Batalkan trigger order SL/TP lama
         3. Pasang bracket SL/TP baru untuk total size gabungan
@@ -105,3 +105,66 @@ class OrderExecutor:
         except Exception as e:
             log.error("[%s] Gagal eksekusi lapis DCA %d: %s", symbol, layer_index + 1, e)
             return None
+
+    def place_dca_limit_grid(
+        self,
+        symbol: str,
+        signal: Signal,
+        grid_orders: list[dict],
+    ) -> list[dict]:
+        """
+        Pasang pre-placed Limit Orders di Binance untuk setiap lapis DCA.
+
+        Args:
+            symbol: simbol Futures (e.g. "BTCUSDT")
+            signal: Signal.BUY atau Signal.SELL (sinyal posisi asal)
+            grid_orders: list dari compute_dca_grid_plan(), setiap item:
+                         {"layer": int, "price": float, "size_usd": float, "size_asset": float}
+
+        Returns:
+            list of placed orders: [{"layer", "orderId", "price", "size_asset", "status"}, ...]
+        """
+        placed = []
+        # Limit order DCA searah dengan sinyal entry (menambah posisi)
+        is_buy = signal == Signal.BUY
+
+        for g in grid_orders:
+            layer_no = g["layer"]
+            price = g["price"]
+            size_asset = self.client.round_size(symbol, g["size_asset"])
+            size_usd = g["size_usd"]
+
+            if size_usd < self.MIN_NOTIONAL_USD:
+                log.warning("[%s] skip DCA Lapis %d: notional $%.2f < minimum $%.0f",
+                            symbol, layer_no, size_usd, self.MIN_NOTIONAL_USD)
+                continue
+            if size_asset <= 0:
+                log.warning("[%s] skip DCA Lapis %d: size asset setelah rounding = 0",
+                            symbol, layer_no)
+                continue
+
+            try:
+                result = self.client.place_limit_order(symbol, is_buy, size_asset, price)
+                order_id = result.get("orderId")
+                log.info("[%s] DCA Limit Order TERPASANG Lapis %d: %s %s @ %.2f size=%s (orderId=%s)",
+                         symbol, layer_no, "BUY" if is_buy else "SELL", symbol, price, size_asset, order_id)
+                placed.append({
+                    "layer": layer_no,
+                    "orderId": order_id,
+                    "price": price,
+                    "size_asset": size_asset,
+                    "size_usd": size_usd,
+                    "status": "PLACED",
+                })
+            except Exception as e:
+                log.error("[%s] Gagal pasang DCA Limit Lapis %d @ %.2f: %s", symbol, layer_no, price, e)
+                placed.append({
+                    "layer": layer_no,
+                    "orderId": None,
+                    "price": price,
+                    "size_asset": size_asset,
+                    "size_usd": size_usd,
+                    "status": "FAILED",
+                })
+
+        return placed
